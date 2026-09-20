@@ -1,16 +1,12 @@
 /**
  * AetherDroid — Control Plane (Hono backend)
- * Handles instance lifecycle, status polling, WebRTC signaling mediation,
- * and the ADB input bridge (touch + keyevent command translation).
+ * Phase 4: APK Pipeline & Repository — package registry, install simulation,
+ * lifecycle, signaling mediation, and ADB input bridge.
  */
 import { Hono } from 'hono'
 import { serveStatic } from 'hono/cloudflare-workers'
 const app = new Hono()
-// Serve static files from public/
 app.use('/*', serveStatic({ root: './public' }))
-// ---------------------------------------------------------------------------
-// CORS (safe for same-origin API + future cross-origin clients)
-// ---------------------------------------------------------------------------
 app.use('/api/*', async (c, next) => {
   await next()
   c.header('Access-Control-Allow-Origin', '*')
@@ -19,9 +15,10 @@ app.use('/api/*', async (c, next) => {
 })
 app.options('/api/*', (c) => c.text('', 204))
 // ---------------------------------------------------------------------------
-// In-memory session registry (per-isolate; prepared for future persistence)
+// In-memory registries (per-isolate; prepared for future persistence)
 // ---------------------------------------------------------------------------
 const sessions = new Map()
+const packages = new Map()
 const OS_VERSIONS = ['13', '12', '11']
 const REGIONS = ['us-east', 'eu-west', 'ap-south']
 function makeSession(overrides = {}) {
@@ -39,6 +36,7 @@ function makeSession(overrides = {}) {
     uptimeSeconds: 0,
     pc: null,
     lastInputSeq: 0,
+    installedApks: [],
     ...overrides,
   }
 }
@@ -46,9 +44,18 @@ function getSession(id) {
   return id ? (sessions.get(id) ?? null) : null
 }
 function serializeSession(s) {
-  const uptime = s.bootedAt
-    ? Math.max(0, Math.floor((Date.now() - new Date(s.bootedAt).getTime()) / 1000))
-    : 0
+  if (!s) {
+    console.warn('[serializeSession] called with a null/undefined session')
+    return null
+  }
+  const bootedMs =
+    s.bootedAt && !Number.isNaN(new Date(s.bootedAt).getTime())
+      ? new Date(s.bootedAt).getTime()
+      : 0
+  if (s.bootedAt && bootedMs === 0) {
+    console.warn(`[serializeSession] invalid bootedAt "${s.bootedAt}" on session ${s.id}; defaulting uptime to 0`)
+  }
+  const uptime = bootedMs ? Math.max(0, Math.floor((Date.now() - bootedMs) / 1000)) : 0
   const h = Math.floor(uptime / 3600)
   const d = Math.floor(h / 24)
   return {
@@ -58,15 +65,90 @@ function serializeSession(s) {
     vRuntime: `${d}d ${h % 24}h`,
   }
 }
+// Seed a couple of well-known mock packages so the repository is not empty
+function seedPackages() {
+  if (packages.size > 0) return
+  const seed = [
+    { id: 'apk-seed-chrome', name: 'Chrome', package: 'com.android.chrome', version: '120.0', size: '84.2 MB' },
+    { id: 'apk-seed-vlc', name: 'Vlc', package: 'org.videolan.vlc', version: '3.5.1', size: '32.7 MB' },
+  ]
+  for (const p of seed) {
+    packages.set(p.id, { ...p, status: 'pending', addedAt: new Date().toISOString() })
+  }
+}
 // ---------------------------------------------------------------------------
-// API: /api/instances — list all phones
+// API: /api/apks — package registry
+// ---------------------------------------------------------------------------
+app.get('/api/apks', (c) => {
+  seedPackages()
+  const list = Array.from(packages.values()).map((p) => ({ ...p }))
+  return c.json({ ok: true, apks: list })
+})
+app.post('/api/apks', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    if (!body?.id || !body?.name) {
+      return c.json({ ok: false, error: 'id and name required' }, 400)
+    }
+    const pkg = {
+      id: String(body.id),
+      name: String(body.name),
+      package: body.package ?? `com.aetherdroid.${String(body.name).toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+      version: body.version ?? '1.0.0',
+      size: body.size ?? '—',
+      status: 'pending',
+      addedAt: new Date().toISOString(),
+    }
+    packages.set(pkg.id, pkg)
+    return c.json({ ok: true, apk: pkg }, 201)
+  } catch (err) {
+    console.error('[api/apks POST] failed:', err?.message ?? err)
+    return c.json({ ok: false, error: 'Failed to register package' }, 500)
+  }
+})
+// ---------------------------------------------------------------------------
+// API: /api/install — simulated ADB package-manager install
+// ---------------------------------------------------------------------------
+app.post('/api/install', async (c) => {
+  try {
+    const body = await c.req.json()
+    const { sessionId, apkId } = body ?? {}
+    if (!sessionId || !apkId) {
+      return c.json({ ok: false, error: 'sessionId and apkId required' }, 400)
+    }
+    const session = getSession(sessionId)
+    if (!session) return c.json({ ok: false, error: 'Instance not found' }, 404)
+    if (session.status !== 'online') {
+      return c.json({ ok: false, error: 'Instance not online' }, 409)
+    }
+    seedPackages()
+    const pkg = packages.get(apkId)
+    if (!pkg) return c.json({ ok: false, error: 'Package not found' }, 404)
+    if (session.installedApks.includes(apkId)) {
+      return c.json({ ok: false, error: 'Package already installed on this instance' }, 409)
+    }
+    const fileName = `${pkg.name.toLowerCase().replace(/[^a-z0-9]/g, '')}-v${pkg.version}.apk`
+    const command = `pm install -r /data/local/tmp/${fileName}`
+    // Simulated install duration (ms) so client progress bars stay accurate
+    const installDelayMs = 2500 + Math.floor(Math.random() * 1500)
+    session.installedApks.push(apkId)
+    pkg.status = 'installed'
+    console.log(`[adb:${sessionId}] $ adb shell ${command} (simulated ${installDelayMs}ms)`)
+    return c.json({ ok: true, sessionId, apkId, command, installDelayMs })
+  } catch (err) {
+    console.error('[api/install] failed:', err?.message ?? err)
+    return c.json({ ok: false, error: 'Install failed' }, 500)
+  }
+})
+// ---------------------------------------------------------------------------
+// API: /api/instances
 // ---------------------------------------------------------------------------
 app.get('/api/instances', (c) => {
   const list = Array.from(sessions.values()).map(serializeSession)
   return c.json({ ok: true, instances: list })
 })
 // ---------------------------------------------------------------------------
-// API: /api/status — aggregate stats, or single instance by ?id=
+// API: /api/status
 // ---------------------------------------------------------------------------
 app.get('/api/status', (c) => {
   const id = c.req.query('id')
@@ -86,7 +168,7 @@ app.get('/api/status', (c) => {
   })
 })
 // ---------------------------------------------------------------------------
-// API: /api/start — provision a new instance
+// API: /api/start
 // ---------------------------------------------------------------------------
 app.post('/api/start', async (c) => {
   try {
@@ -96,8 +178,6 @@ app.post('/api/start', async (c) => {
       cpu: Number(body?.cpu) > 0 ? Number(body.cpu) : 2,
       ram: Number(body?.ram) > 0 ? Number(body.ram) : 4,
     })
-    // Workers have no cross-request timers; boot completes immediately with
-    // bootStartedAt so the client can animate the provisioning transition.
     session.status = 'online'
     session.bootedAt = new Date().toISOString()
     sessions.set(session.id, session)
@@ -108,7 +188,7 @@ app.post('/api/start', async (c) => {
   }
 })
 // ---------------------------------------------------------------------------
-// API: /api/power — start / stop / restart actions
+// API: /api/power
 // ---------------------------------------------------------------------------
 app.post('/api/power', async (c) => {
   try {
@@ -139,7 +219,7 @@ app.post('/api/power', async (c) => {
   }
 })
 // ---------------------------------------------------------------------------
-// API: /api/signal — WebRTC signaling exchange (SDP offer → answer + ICE)
+// API: /api/signal — WebRTC signaling exchange
 // ---------------------------------------------------------------------------
 app.post('/api/signal', async (c) => {
   try {
@@ -173,9 +253,7 @@ app.post('/api/signal', async (c) => {
   }
 })
 // ---------------------------------------------------------------------------
-// API: /api/input — ADB input bridge (touch gestures + hardware keyevents)
-// Simulates translation of normalized payloads into shell commands that the
-// Data Plane host would execute against the Redroid container.
+// API: /api/input — ADB input bridge (touch/key + installation commands)
 // ---------------------------------------------------------------------------
 const ANDROID_RESOLUTION = { width: 1080, height: 1920 }
 function clamp01(n) {
@@ -191,7 +269,6 @@ function translateTouch(session, body) {
   const X = adbCoord(x, ANDROID_RESOLUTION.width)
   const Y = adbCoord(y, ANDROID_RESOLUTION.height)
   if (type === 'down') {
-    // Actual swipe/tap resolved on 'up'; record anchor point
     session._touchAnchor = { x: X, y: Y, ts: Date.now() }
     return `input motionevent DOWN ${X} ${Y}`
   }
@@ -203,9 +280,7 @@ function translateTouch(session, body) {
     session._touchAnchor = null
     if (anchor) {
       const dist = Math.hypot(X - anchor.x, Y - anchor.y)
-      if (dist < 20) {
-        return `input tap ${X} ${Y}`
-      }
+      if (dist < 20) return `input tap ${X} ${Y}`
       return `input swipe ${anchor.x} ${anchor.y} ${X} ${Y}`
     }
     return `input tap ${X} ${Y}`
@@ -214,9 +289,7 @@ function translateTouch(session, body) {
 }
 function translateKey(body) {
   const KEYCODES = { back: 4, home: 3, recents: 187, power: 26 }
-  const code = Number.isInteger(body?.keycode)
-    ? body.keycode
-    : KEYCODES[body?.key]
+  const code = Number.isInteger(body?.keycode) ? body.keycode : KEYCODES[body?.key]
   if (!code) return null
   return `input keyevent ${code}`
 }
@@ -224,15 +297,14 @@ app.post('/api/input', async (c) => {
   try {
     const body = await c.req.json()
     const { sessionId, kind, seq } = body ?? {}
-    if (!sessionId || !['touch', 'key'].includes(kind)) {
-      return c.json({ ok: false, error: 'sessionId and valid kind (touch|key) required' }, 400)
+    if (!sessionId || !['touch', 'key', 'installation'].includes(kind)) {
+      return c.json({ ok: false, error: 'sessionId and valid kind (touch|key|installation) required' }, 400)
     }
     const session = getSession(sessionId)
     if (!session) return c.json({ ok: false, error: 'Instance not found' }, 404)
     if (session.status !== 'online') {
       return c.json({ ok: false, error: 'Instance not online' }, 409)
     }
-    // Ordering guard: drop stale/out-of-order events
     if (Number.isInteger(seq)) {
       if (seq <= session.lastInputSeq) {
         return c.json({ ok: false, error: 'Stale event dropped' }, 409)
@@ -240,13 +312,21 @@ app.post('/api/input', async (c) => {
       session.lastInputSeq = seq
     }
     let command = null
-    if (kind === 'touch') command = translateTouch(session, body)
-    else command = translateKey(body)
+    let processingMs = 2 + Math.floor(Math.random() * 6)
+    if (kind === 'touch') {
+      command = translateTouch(session, body)
+    } else if (kind === 'key') {
+      command = translateKey(body)
+    } else if (kind === 'installation') {
+      // Recognize installation commands and log explicit pm install strings
+      const apkName = body?.apkName ?? 'app'
+      command = `pm install -r /data/local/tmp/${String(apkName).replace(/[^a-zA-Z0-9._-]/g, '')}.apk`
+      processingMs = 2000 + Math.floor(Math.random() * 1500)
+      session._pendingInstall = { apkName, startedAt: Date.now() }
+    }
     if (!command) {
       return c.json({ ok: false, error: 'Unrecognized input payload' }, 400)
     }
-    // Simulated server-side processing duration (ms) for latency accounting
-    const processingMs = 2 + Math.floor(Math.random() * 6)
     console.log(`[adb:${sessionId}] $ ${command} (simulated ${processingMs}ms)`)
     return c.json({ ok: true, sessionId, command, processingMs })
   } catch (err) {
