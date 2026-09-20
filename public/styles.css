@@ -1,0 +1,149 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+html {
+  scroll-behavior: smooth;
+}
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(59, 130, 246, 0.12), transparent),
+    #0F172A;
+  min-height: 100vh;
+}
+/* ---------- Glassmorphic panel ---------- */
+.glass-panel {
+  background: rgba(30, 41, 59, 0.5);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(51, 65, 85, 0.8);
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+.glass-panel:hover {
+  border-color: rgba(59, 130, 246, 0.4);
+}
+/* ---------- Glow button ---------- */
+.glow-button {
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.35);
+  transition: background-color 0.2s ease, transform 0.15s ease, box-shadow 0.2s ease;
+}
+.glow-button:hover:not(:disabled) {
+  transform: translateY(-1px) scale(1.02);
+  box-shadow: 0 0 32px rgba(59, 130, 246, 0.55);
+}
+.glow-button:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+}
+/* ---------- Disabled in-flight states ---------- */
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button {
+  transition: background-color 0.2s ease, color 0.2s ease, opacity 0.2s ease, transform 0.15s ease;
+}
+/* ---------- Loading overlay ---------- */
+.loading-overlay {
+  opacity: 0;
+  pointer-events: none;
+}
+.loading-overlay:not(.hidden) {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* ---------- Status dots & pulse ---------- */
+.pulse-dot {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+/* ---------- Provisioning / connecting pulse (blue) ---------- */
+.pulse-blue {
+  animation: pulseBlue 1.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes pulseBlue {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.55);
+  }
+  50% {
+    opacity: 0.6;
+    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+  }
+}
+/* ---------- 9:16 phone container ---------- */
+.aspect-ratio-9-16 {
+  aspect-ratio: 9 / 16;
+}
+/* ---------- Loading spinner ---------- */
+.loading-spinner {
+  width: 2.5rem;
+  height: 2.5rem;
+  border: 3px solid rgba(51, 65, 85, 0.8);
+  border-top-color: #3B82F6;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+/* ---------- View transitions ---------- */
+.view {
+  animation: viewFade 0.35s ease both;
+}
+@keyframes viewFade {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+/* ---------- Opacity / transform transition utilities ---------- */
+.fade-transition {
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+.opacity-0 {
+  opacity: 0;
+}
+/* ---------- Skeleton shimmer ---------- */
+.skeleton {
+  background: linear-gradient(90deg, rgba(30, 41, 59, 0.6) 25%, rgba(51, 65, 85, 0.6) 50%, rgba(30, 41, 59, 0.6) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  border-radius: 0.5rem;
+}
+@keyframes shimmer {
+  to { background-position: -200% 0; }
+}
+/* ---------- Toast ---------- */
+.toast {
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid rgba(51, 65, 85, 1);
+  backdrop-filter: blur(8px);
+  animation: toastIn 0.25s ease both;
+}
+.toast.success { border-color: rgba(16, 185, 129, 0.5); }
+.toast.error { border-color: rgba(239, 68, 68, 0.5); }
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(1rem); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.toast.leaving {
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  opacity: 0;
+  transform: translateX(1rem);
+}
+/* ---------- Reduced motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+/* ---------- Scrollbar ---------- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0F172A; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #475569; }
