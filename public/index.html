@@ -42,11 +42,18 @@
           <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="7" y="2" width="10" height="20" rx="2"/><line x1="11" y1="19" x2="13" y2="19"/></svg>
           Live View Terminal
         </button>
+        <button data-view="repository" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium text-slate-400 hover:text-slate-100 hover:bg-slate-800/70 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
+          APK Repository
+        </button>
       </nav>
       <div class="px-4 py-4 border-t border-slate-800 text-xs text-slate-500">
-        <div class="flex items-center gap-2 px-2 py-2">
-          <span class="w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span>
-          Control Plane Online
+        <div class="flex items-center justify-between px-2 py-2">
+          <span class="flex items-center gap-2">
+            <span id="health-badge-dot" class="w-2 h-2 rounded-full bg-slate-500 status-indicator"></span>
+            <span id="health-badge-text">Probing nodes…</span>
+          </span>
+          <span class="px-2 py-0.5 rounded-full bg-slate-800 border border-slate-700" id="health-badge-pct">--%</span>
         </div>
       </div>
     </aside>
@@ -63,7 +70,7 @@
             <h2 id="page-title" class="text-base sm:text-lg font-semibold truncate">Command Center</h2>
           </div>
           <div class="flex items-center gap-3 text-xs text-slate-400">
-            <span class="hidden sm:flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span> All systems nominal</span>
+            <span class="hidden sm:flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span> Watchdog active</span>
             <span class="px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 font-medium" id="clock">--:--:--</span>
           </div>
         </div>
@@ -106,8 +113,20 @@
               </div>
               <div class="glass-panel rounded-2xl p-5">
                 <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">Uptime</p>
-                <p class="text-3xl font-bold mt-2 text-emerald-400">99.9%</p>
+                <p id="stat-uptime" class="text-3xl font-bold mt-2 text-emerald-400">--%</p>
               </div>
+            </div>
+            <!-- System Health (Watchdog) -->
+            <div class="glass-panel rounded-2xl p-6 mb-8">
+              <div class="flex items-center justify-between mb-5">
+                <h4 class="text-sm font-semibold flex items-center gap-2">
+                  <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                  System Health
+                  <span class="badge" id="watchdog-timestamp">watchdog: --</span>
+                </h4>
+                <span class="text-xs text-slate-500">Auto-refreshes every 15s</span>
+              </div>
+              <div id="health-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"></div>
             </div>
             <!-- Instance grid -->
             <div id="instance-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6" aria-live="polite"></div>
@@ -143,7 +162,8 @@
                     Session
                   </h4>
                   <p class="text-xs text-slate-400 mb-1">Connected Device</p>
-                  <p id="session-device" class="text-sm font-mono text-slate-100 mb-4 truncate">—</p>
+                  <p id="session-device" class="text-sm font-mono text-slate-100 mb-1 truncate">—</p>
+                  <p class="text-[11px] text-slate-500 mb-4">Last seen: <span id="session-lastseen" class="font-mono">—</span></p>
                   <div class="flex gap-2">
                     <button id="reconnect-btn" class="flex-1 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">Reconnect</button>
                     <button id="end-session-btn" class="flex-1 px-3 py-2 rounded-lg bg-red-600/20 hover:bg-red-600/30 text-red-400 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400">End Session</button>
@@ -186,9 +206,51 @@
                     </div>
                     <p id="apk-status-text" class="text-xs text-slate-500 mt-2">Uploading…</p>
                   </div>
+                  <button id="go-repository-btn" class="mt-4 w-full px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">Open APK Repository →</button>
+                </div>
+                <!-- ADB Console (collapsible) -->
+                <div class="glass-panel rounded-2xl overflow-hidden">
+                  <button id="console-toggle" aria-expanded="false" aria-controls="adb-console" class="w-full flex items-center justify-between px-5 py-4 text-sm font-semibold hover:bg-slate-800/40 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">
+                    <span class="flex items-center gap-2">
+                      <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                      ADB Console
+                    </span>
+                    <svg id="console-chevron" class="w-4 h-4 text-slate-500 transition-transform duration-200" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+                  </button>
+                  <div id="adb-console" class="hidden border-t border-slate-800">
+                    <div id="console-output" class="console-output p-4 h-48 overflow-y-auto font-mono text-[11px] leading-relaxed" role="log" aria-live="polite" aria-label="ADB shell log"></div>
+                  </div>
                 </div>
               </div>
             </div>
+          </section>
+          <!-- ============ APK REPOSITORY VIEW ============ -->
+          <section id="view-repository" class="view hidden" aria-labelledby="repo-heading">
+            <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
+              <div>
+                <h3 id="repo-heading" class="text-2xl font-bold tracking-tight">APK Repository</h3>
+                <p class="text-sm text-slate-400 mt-1">Uploaded packages ready for installation on your cloud phones.</p>
+              </div>
+              <div class="flex items-center gap-2">
+                <button id="repo-refresh-btn" class="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v6h-6"/></svg>
+                  Refresh
+                </button>
+                <button id="repo-upload-btn" class="glow-button inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M17 8l-5-5-5 5"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  Upload APK
+                </button>
+                <input id="repo-apk-input" type="file" accept=".apk" class="sr-only" aria-hidden="true">
+              </div>
+            </div>
+            <!-- Repository dropzone -->
+            <div id="repo-drop" class="mb-8 rounded-2xl border-2 border-dashed border-slate-700 hover:border-blue-500 bg-slate-900/40 p-8 text-center transition-colors cursor-pointer" role="button" tabindex="0" aria-label="Drop APK files here or press Enter to browse">
+              <svg class="w-10 h-10 mx-auto text-slate-500 mb-3" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M17 8l-5-5-5 5"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              <p class="text-sm text-slate-300 font-medium">Drag &amp; drop APK files here</p>
+              <p class="text-xs text-slate-500 mt-1">or click to browse — files are validated and registered in your repository</p>
+            </div>
+            <!-- Package grid -->
+            <div id="package-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6" aria-live="polite"></div>
           </section>
         </div>
       </div>
