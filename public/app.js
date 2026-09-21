@@ -1,17 +1,18 @@
 /**
  * AetherDroid — Frontend Router & UI Controller
- * Phase 5: Persistence & Watchdog — session recovery across reloads,
- * watchdog health monitoring, keepalive pings, live uptime ticks,
- * and ADB console logging.
+ * Real streaming: WebRTC video via RTCPeerConnection to the Runtime Host.
+ * Real APK pipeline: multipart upload → host adb install → real package names.
  */
 import { onInput, onHardwareKey, emitKeyboard, initInputHandler } from './input-handler.js';
 const API = {
+  hostStatus: () => '/api/host-status',
   instances: () => '/api/instances',
   start: () => '/api/start',
   power: () => '/api/power',
   signal: () => '/api/signal',
   input: () => '/api/input',
   apks: () => '/api/apks',
+  upload: (params) => `/api/apks/upload${params ? `?${params}` : ''}`,
   install: () => '/api/install',
   watchdog: () => '/api/watchdog',
 };
@@ -24,6 +25,10 @@ const state = {
   pendingAction: false,
   keyboardCapture: false,
   consoleOpen: false,
+  hostOnline: false,
+  pc: null,
+  remoteStream: null,
+  retryAttempt: 0,
 };
 const $ = (id) => document.getElementById(id);
 async function api(path, options = {}) {
@@ -33,7 +38,10 @@ async function api(path, options = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data?.ok === false) {
-    throw new Error(data?.error ?? `Request failed (${res.status})`);
+    const err = new Error(data?.error ?? `Request failed (${res.status})`);
+    err.hostOnline = data?.hostOnline;
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -80,6 +88,35 @@ function setBtnLoading(btn, on) {
   btn.classList.toggle('opacity-60', on);
   btn.classList.toggle('cursor-wait', on);
 }
+// Host-offline warn throttle (once per minute max)
+let lastHostWarnAt = 0;
+// ---------------------------------------------------------------------------
+// Host connection status
+// ---------------------------------------------------------------------------
+async function checkHostStatus(force = false) {
+  try {
+    const data = await api(API.hostStatus());
+    setHostOnline(Boolean(data.hostOnline));
+  } catch (_) {
+    setHostOnline(false);
+  }
+}
+function setHostOnline(online) {
+  const changed = online !== state.hostOnline;
+  state.hostOnline = online;
+  const banner = $('host-banner');
+  banner?.classList.toggle('hidden', online);
+  // Disable provisioning when host is offline
+  const provisionBtn = $('provision-btn');
+  if (provisionBtn) {
+    provisionBtn.disabled = !online;
+    provisionBtn.title = online ? '' : 'Requires a connected Runtime Host';
+  }
+  if (changed) {
+    if (online) toast('Runtime Host connected', 'success');
+    else toast('Runtime Host offline — streaming disabled', 'error');
+  }
+}
 // ---------------------------------------------------------------------------
 // Router (dashboard | phone | repository)
 // ---------------------------------------------------------------------------
@@ -115,9 +152,7 @@ const STATUS_STYLES = {
   online: { dot: 'bg-emerald-500', label: 'Online', text: 'text-emerald-400' },
   offline: { dot: 'bg-slate-500', label: 'Offline', text: 'text-slate-400' },
   booting: { dot: 'bg-amber-400 pulse-blue', label: 'Provisioning…', text: 'text-amber-400' },
-  connecting: { dot: 'bg-blue-400 pulse-blue', label: 'Connecting…', text: 'text-blue-400' },
 };
-/** Live server-diff uptime, e.g. "2d 5h" or "34m". Ticks every minute. */
 function formatUptime(bootedAt, fallback) {
   if (!bootedAt) return fallback ?? '0h';
   const ms = new Date(bootedAt).getTime();
@@ -144,7 +179,7 @@ function renderStats() {
 }
 function instanceCard(inst) {
   const s = STATUS_STYLES[inst.status] ?? STATUS_STYLES.offline;
-  const connectable = inst.status === 'online';
+  const connectable = inst.status === 'online' && state.hostOnline;
   return `
     <article class="glass-panel rounded-2xl p-6 flex flex-col gap-4" data-id="${inst.id}">
       <div class="flex items-start justify-between">
@@ -171,14 +206,14 @@ function instanceCard(inst) {
       <div class="flex gap-2 mt-auto pt-2">
         <button class="connect-btn flex-1 px-3 py-2 rounded-lg text-xs font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 disabled:opacity-50 disabled:cursor-not-allowed ${
           connectable ? 'bg-blue-600 hover:bg-blue-500 text-white' : 'bg-slate-800 text-slate-500 cursor-not-allowed'
-        }" data-id="${inst.id}" ${connectable ? '' : 'disabled'}>
+        }" data-id="${inst.id}" ${connectable ? '' : 'disabled'} title="${connectable ? '' : state.hostOnline ? 'Instance offline' : 'Runtime Host offline'}">
           ${inst.status === 'booting' ? 'Provisioning…' : connectable ? 'Connect' : 'Offline'}
         </button>
         <button class="power-btn px-3 py-2 rounded-lg text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 disabled:opacity-50 disabled:cursor-not-allowed ${
           inst.status === 'offline'
             ? 'bg-emerald-600/15 hover:bg-emerald-600/25 text-emerald-400'
             : 'bg-red-600/15 hover:bg-red-600/25 text-red-400'
-        }" data-id="${inst.id}" data-action="${inst.status === 'offline' ? 'start' : 'stop'}" aria-label="${inst.status === 'offline' ? 'Start instance' : 'Stop instance'}">
+        }" data-id="${inst.id}" data-action="${inst.status === 'offline' ? 'start' : 'stop'}" aria-label="${inst.status === 'offline' ? 'Start instance' : 'Stop instance'}" ${state.hostOnline ? '' : 'disabled'}>
           ${inst.status === 'offline' ? 'Start' : 'Stop'}
         </button>
       </div>
@@ -191,7 +226,7 @@ function renderInstances() {
     grid.innerHTML = `
       <div class="glass-panel rounded-2xl p-10 text-center md:col-span-2 xl:col-span-3">
         <p class="text-slate-300 font-medium">No cloud phones yet</p>
-        <p class="text-sm text-slate-500 mt-1">Provision your first Android instance to get started.</p>
+        <p class="text-sm text-slate-500 mt-1">${state.hostOnline ? 'Provision your first Android instance to get started.' : 'Runtime Host is offline — connect a host to provision phones.'}</p>
       </div>`;
   } else {
     grid.innerHTML = state.instances.map(instanceCard).join('');
@@ -208,15 +243,8 @@ async function fetchInstances() {
   try {
     const data = await api(API.instances());
     state.instances = data.instances ?? [];
+    if (data.hostOnline !== undefined) setHostOnline(Boolean(data.hostOnline));
     renderInstances();
-    try {
-      const stats = await api('/api/status');
-      if (stats?.stats) {
-        $('stat-instances').textContent = String(stats.stats.active ?? 0);
-        $('stat-cpu').textContent = String(stats.stats.vcpu ?? 0);
-        $('stat-ram').textContent = String(stats.stats.ram ?? 0);
-      }
-    } catch (_) { /* stats optional */ }
   } catch (err) {
     console.error('[fetchInstances] failed:', err?.message ?? err);
     if (grid) {
@@ -266,9 +294,11 @@ async function fetchWatchdog() {
     const data = await api(API.watchdog());
     const grid = $('health-grid');
     if (grid && data?.nodes) {
-      grid.innerHTML = data.nodes.map(healthCard).join('');
+      grid.innerHTML = data.nodes.length
+        ? data.nodes.map(healthCard).join('')
+        : '<p class="text-sm text-slate-500 sm:col-span-2 lg:col-span-3">No Runtime Host connected — real node metrics unavailable.</p>';
     }
-    const overall = data?.overall ?? 'operational';
+    const overall = data?.overall ?? 'down';
     const pct = data?.uptimePct ?? '--';
     const dot = $('health-badge-dot');
     const text = $('health-badge-text');
@@ -277,7 +307,7 @@ async function fetchWatchdog() {
     if (dot) {
       dot.className = `status-indicator w-2 h-2 rounded-full ${overall === 'operational' ? 'bg-emerald-500' : overall === 'down' ? 'bg-red-500' : 'bg-amber-400 pulse-dot'}`;
     }
-    if (text) text.textContent = overall === 'operational' ? 'All nodes healthy' : overall === 'down' ? 'Nodes offline' : 'Degraded nodes';
+    if (text) text.textContent = overall === 'operational' ? 'Host healthy' : overall === 'down' ? 'Runtime Host offline' : 'Host degraded';
     if (badgePct) badgePct.textContent = `${pct}%`;
     if (statUptime) statUptime.textContent = `${pct}%`;
     const ts = $('watchdog-timestamp');
@@ -307,14 +337,19 @@ async function provision() {
     if (data?.instance) {
       state.instances.push(data.instance);
       renderInstances();
-      logConsole(`provision ${data.instance.id} --status online`, 'success');
+      logConsole(`provision ${data.instance.id} → online`, 'success');
       toast(`Provisioned ${data.instance.id}`, 'success');
     }
     await fetchInstances();
   } catch (err) {
     console.error('[provision] failed:', err?.message ?? err);
     logConsole(`provision failed: ${err?.message ?? 'unknown error'}`, 'error');
-    toast(err?.message ?? 'Provisioning failed', 'error');
+    if (err.hostOnline === false) {
+      setHostOnline(false);
+      toast('Runtime Host not connected — cannot provision', 'error');
+    } else {
+      toast(err?.message ?? 'Provisioning failed', 'error');
+    }
   } finally {
     setBtnLoading(btn, false);
     setLoading(false);
@@ -339,6 +374,7 @@ async function powerCycle(id, action) {
     }
   } catch (err) {
     console.error('[powerCycle] failed:', err?.message ?? err);
+    if (err.hostOnline === false) setHostOnline(false);
     logConsole(`power ${action} ${id} failed`, 'error');
     toast(err?.message ?? 'Power action failed', 'error');
   } finally {
@@ -368,6 +404,14 @@ function persistApks() {
     console.warn('[persistApks] storage unavailable:', err?.message ?? err);
   }
 }
+function mergeApk(apk) {
+  if (!apk?.id) return;
+  const idx = state.apks.findIndex((a) => a.id === apk.id);
+  if (idx >= 0) state.apks[idx] = { ...state.apks[idx], ...apk };
+  else state.apks.unshift(apk);
+  persistApks();
+  if (state.view === 'repository') renderApks();
+}
 function deriveApkName(fileName) {
   const base = fileName.replace(/\.apk$/i, '');
   const parts = base.split(/[-_.]/).filter(Boolean);
@@ -377,8 +421,12 @@ function deriveApkName(fileName) {
 }
 function packageCard(apk) {
   const s = APK_STATES[apk.status] ?? APK_STATES.pending;
-  const installable = apk.status === 'pending';
-  const online = state.instances.some((i) => i.status === 'online');
+  const installable = apk.status === 'pending' && apk.uploaded;
+  const online = state.instances.some((i) => i.status === 'online') && state.hostOnline;
+  const canInstall = installable && online;
+  const installTitle = !apk.uploaded
+    ? 'Upload APK with the target device connected'
+    : !online ? 'No online device on the Runtime Host' : '';
   return `
     <article class="package-card ${s.card}" data-apk-id="${apk.id}">
       <div class="flex items-start justify-between gap-3">
@@ -388,7 +436,7 @@ function packageCard(apk) {
           </div>
           <div class="min-w-0">
             <h4 class="font-semibold text-slate-100 truncate">${apk.name ?? 'Package'}</h4>
-            <p class="text-xs font-mono text-slate-500 mt-0.5 truncate">${apk.package ?? apk.id}</p>
+            <p class="text-xs font-mono text-slate-500 mt-0.5 truncate">${apk.packageName ?? apk.package ?? apk.id}</p>
           </div>
         </div>
         <span class="badge ${s.badge} shrink-0">${s.label}</span>
@@ -396,7 +444,7 @@ function packageCard(apk) {
       <div class="flex flex-wrap gap-2">
         <span class="badge version">v${apk.version ?? '1.0.0'}</span>
         <span class="badge size">${apk.size ?? '—'}</span>
-        <span class="badge">APK</span>
+        <span class="badge">${apk.uploaded ? 'On host' : 'Not uploaded'}</span>
       </div>
       ${apk.status === 'installing' ? `
       <div class="h-1.5 rounded-full bg-slate-800 overflow-hidden">
@@ -404,8 +452,8 @@ function packageCard(apk) {
       </div>` : ''}
       <div class="flex gap-2 mt-auto pt-2">
         <button class="install-btn flex-1 px-3 py-2 rounded-lg text-xs font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 disabled:opacity-50 disabled:cursor-not-allowed ${
-          installable && online ? 'bg-blue-600 hover:bg-blue-500 text-white' : 'bg-slate-800 text-slate-500 cursor-not-allowed'
-        }" data-apk-id="${apk.id}" ${installable && online ? '' : 'disabled'}>
+          canInstall ? 'bg-blue-600 hover:bg-blue-500 text-white' : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+        }" data-apk-id="${apk.id}" ${canInstall ? '' : 'disabled'} title="${installTitle}">
           ${apk.status === 'installed' ? 'Installed' : apk.status === 'installing' ? 'Installing…' : 'Install'}
         </button>
         <button class="delete-btn px-3 py-2 rounded-lg text-xs font-medium bg-red-600/15 hover:bg-red-600/25 text-red-400 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400" data-apk-id="${apk.id}" aria-label="Remove ${apk.name ?? 'package'} from repository">
@@ -437,7 +485,6 @@ async function fetchApks() {
   try {
     const data = await api(API.apks());
     const serverApks = data.apks ?? [];
-    // Server packages are authoritative on each entry; merge over local pending state
     const byId = new Map();
     serverApks.forEach((a) => byId.set(a.id, a));
     state.apks.forEach((a) => byId.set(a.id, a));
@@ -465,129 +512,214 @@ async function fetchApks() {
     }
   }
 }
-// Unified APK registration — used by both Live View dropzone and Repository
+// ---------------------------------------------------------------------------
+// Real APK upload pipeline (multipart → worker → host adb install)
+// ---------------------------------------------------------------------------
+function newApkId() {
+  return `apk-${Math.random().toString(16).slice(2, 8)}`;
+}
+/** Upload a real APK File via XHR for progress. Returns the server apk record. */
+function uploadApkFile(file, { apkId, sessionId, onProgress } = {}) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams();
+    params.set('id', apkId ?? newApkId());
+    params.set('name', deriveApkName(file.name).name);
+    if (sessionId) params.set('sessionId', sessionId);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', API.upload(params.toString()));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && typeof onProgress === 'function') {
+        onProgress(Math.min(99, Math.round((e.loaded / e.total) * 100)));
+      }
+    };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText ?? '{}'); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300 && data?.ok) {
+        onProgress?.(100);
+        resolve(data);
+      } else {
+        reject(Object.assign(new Error(data?.error ?? `Upload failed (${xhr.status})`), { status: xhr.status, hostOnline: data?.hostOnline }));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Network error during APK upload'));
+    const fd = new FormData();
+    fd.append('file', file);
+    xhr.send(fd);
+  });
+}
+/** Live-view progress panel helpers */
+function showUploadProgress(fileName, pct = 0, statusText = 'Uploading to Runtime Host…') {
+  const wrap = $('apk-progress');
+  if (!wrap) return;
+  wrap.classList.remove('hidden');
+  $('apk-file-name').textContent = fileName;
+  $('apk-pct').textContent = `${pct}%`;
+  $('apk-bar').style.width = `${pct}%`;
+  $('apk-status-text').textContent = statusText;
+}
+function finishUploadProgress(statusText, success = true) {
+  const wrap = $('apk-progress');
+  if (!wrap) return;
+  $('apk-pct').textContent = '100%';
+  $('apk-bar').style.width = '100%';
+  $('apk-status-text').textContent = statusText;
+  $('apk-status-text').className = `text-xs mt-2 ${success ? 'text-emerald-400' : 'text-red-400'}`;
+  setTimeout(() => wrap.classList.add('hidden'), 4000);
+}
+/**
+ * Full upload flow: validates the file, POSTs multipart bytes, merges the
+ * returned registry record. Local-session fallback only when the network
+ * request itself fails.
+ */
+async function handleApkUpload(file, { sessionId = null, showProgress = false } = {}) {
+  if (!file) return null;
+  if (!file.name.toLowerCase().endsWith('.apk')) {
+    toast('Only .apk files are supported', 'error');
+    return null;
+  }
+  if (showProgress) showUploadProgress(file.name, 0);
+  try {
+    const data = await uploadApkFile(file, {
+      sessionId,
+      onProgress: (pct) => {
+        if (showProgress) {
+          showUploadProgress(file.name, pct, sessionId ? 'Uploading to Runtime Host…' : 'Uploading to registry…');
+        }
+      },
+    });
+    const apk = data?.apk;
+    if (apk) mergeApk(apk);
+    if (data?.uploaded) {
+      logConsole(`adb install -r ${file.name} → Success (${data.packageName ?? 'package detected'})`, 'success');
+      if (showProgress) finishUploadProgress('Installed on device', true);
+      toast(`${apk?.name ?? file.name} installed on ${sessionId}`, 'success');
+    } else {
+      logConsole(`registered ${file.name} — metadata saved, upload to host pending`);
+      if (showProgress) finishUploadProgress('Saved to registry — connect a device to upload', true);
+      toast(`${apk?.name ?? file.name} saved. Connect a device to upload.`, 'info');
+    }
+    if (data?.hostOnline === false) setHostOnline(false);
+    return apk ?? null;
+  } catch (err) {
+    console.error('[handleApkUpload] failed:', err?.message ?? err);
+    if (showProgress) finishUploadProgress(err?.message ?? 'Upload failed', false);
+    if (err.hostOnline === false) setHostOnline(false);
+    toast(err?.message ?? 'APK upload failed', 'error');
+    // Local-only fallback so the UI still reflects the attempt
+    const { name, version } = deriveApkName(file.name);
+    const apk = {
+      id: newApkId(),
+      name,
+      version,
+      package: `com.aetherdroid.${name.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+      size: file.size ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` : '—',
+      status: 'pending',
+      uploaded: false,
+      packageName: null,
+      targetInstance: null,
+      fileName: file.name,
+      addedAt: new Date().toISOString(),
+    };
+    mergeApk(apk);
+    logConsole(`upload ${file.name} failed: ${err?.message ?? 'unknown'}`, 'error');
+    return apk;
+  }
+}
+// Back-compat shim (kept for callers that register without a File object)
 function registerApk(fileName, fileSize) {
-  const id = `apk-${Math.random().toString(16).slice(2, 8)}`;
   const { name, version } = deriveApkName(fileName);
   const apk = {
-    id,
+    id: newApkId(),
     name,
     version,
     package: `com.aetherdroid.${name.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-    size: fileSize ? `${(fileSize / (1024 * 1024)).toFixed(1)} MB` : '12.4 MB',
+    size: fileSize ? `${(fileSize / (1024 * 1024)).toFixed(1)} MB` : '—',
     status: 'pending',
+    uploaded: false,
+    packageName: null,
+    targetInstance: null,
     fileName,
     addedAt: new Date().toISOString(),
   };
-  state.apks.unshift(apk);
-  persistApks();
+  mergeApk(apk);
   if (state.view === 'repository') renderApks();
-  logConsole(`adb push ${fileName} /data/local/tmp/`);
-  toast(`${name} added to repository`, 'success');
   return apk;
 }
 // ---------------------------------------------------------------------------
-// Install pipeline
+// Install pipeline (requires apk.uploaded && apk.targetInstance)
 // ---------------------------------------------------------------------------
-let installQueue = Promise.resolve();
-function animateInstallProgress(cardEl, durationMs) {
-  const bar = cardEl?.querySelector('.apk-install-bar');
-  if (!bar) return;
-  const started = performance.now();
-  const tick = () => {
-    const elapsed = performance.now() - started;
-    const pct = Math.min(95, (elapsed / durationMs) * 100);
-    bar.style.width = `${pct}%`;
-    if (elapsed < durationMs) requestAnimationFrame(tick);
-    else bar.style.width = '100%';
-  };
-  requestAnimationFrame(tick);
-}
-function installApk(apkId) {
+async function installApk(apkId) {
   const apk = state.apks.find((a) => a.id === apkId);
   if (!apk) {
     toast('Package not found', 'error');
     return;
   }
   const inst = state.instances.find((i) => i.status === 'online');
-  if (!inst) {
-    toast('No online device. Provision a phone first.', 'error');
+  if (!inst || !state.hostOnline) {
+    toast('No online device. Provision a phone on a connected Runtime Host first.', 'error');
+    return;
+  }
+  if (!apk.uploaded) {
+    toast('Upload APK with the target device connected first', 'error');
     return;
   }
   if (apk.status !== 'pending') return;
   apk.status = 'installing';
   persistApks();
   renderApks();
-  const cardEl = document.querySelector(`.package-card[data-apk-id="${apkId}"]`);
   toast(`Installing ${apk.name} on ${inst.id}…`);
-  installQueue = installQueue.then(async () => {
-    try {
-      const data = await api(API.install(), {
-        method: 'POST',
-        body: JSON.stringify({ sessionId: inst.id, apkId: apk.id }),
-      });
-      const delay = Number(data?.installDelayMs) || 2500;
-      animateInstallProgress(cardEl, delay);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      apk.status = 'installed';
-      persistApks();
-      if (state.view === 'repository') renderApks();
-      logConsole(`pm install -r /data/local/tmp/${apk.fileName ?? apk.name}.apk → Success`, 'success');
-      toast(`${apk.name} installed successfully`, 'success');
-    } catch (err) {
-      console.error('[installApk] failed:', err?.message ?? err);
-      apk.status = 'pending';
-      persistApks();
-      if (state.view === 'repository') renderApks();
-      logConsole(`install ${apk.name} failed: ${err?.message ?? 'unknown'}`, 'error');
-      toast(err?.message ?? 'Installation failed', 'error');
-    }
-  });
-}
-// ---------------------------------------------------------------------------
-// Live view: signaling + mock stream
-// ---------------------------------------------------------------------------
-function startStream() {
-  const inst = state.instances.find((i) => i.status === 'online');
-  const statusEl = $('stream-status');
-  const textEl = $('stream-status-text');
-  const deviceEl = $('session-device');
-  const canvas = $('phone-canvas');
-  if (!statusEl || !textEl || !deviceEl || !canvas) return;
-  if (!inst) {
-    textEl.textContent = 'No online device. Provision a phone first.';
-    deviceEl.textContent = '—';
-    canvas.classList.add('opacity-30');
-    return;
-  }
-  state.activeSession = inst;
-  deviceEl.textContent = `${inst.name ?? inst.id} · ${inst.id}`;
-  updateLastSeen(inst.lastSeen);
-  textEl.textContent = 'Handshaking with signaling server…';
-  canvas.classList.remove('opacity-30');
-  drawMockCanvas(canvas);
-  logConsole(`adb connect ${inst.id}.aetherdroid.internal:5555`);
-  signalExchange(inst.id)
-    .then(() => {
-      statusEl.classList.add('opacity-0', 'pointer-events-none');
-      setLiveIndicator(true);
-      logConsole('Connectivity established — video track live', 'success');
-      toast(`Connected to ${inst.name ?? inst.id}`, 'success');
-    })
-    .catch((err) => {
-      console.error('[signalExchange] failed:', err?.message ?? err);
-      logConsole(`signaling failed: ${err?.message ?? 'unknown'}`, 'error');
-      textEl.textContent = 'Signaling failed. Use Reconnect to retry.';
-      toast('Signaling handshake failed', 'error');
+  try {
+    const data = await api(API.install(), {
+      method: 'POST',
+      body: JSON.stringify({ sessionId: inst.id, apkId: apk.id }),
     });
+    const delay = Number(data?.installDelayMs) || 1000;
+    const cardEl = document.querySelector(`.package-card[data-apk-id="${apkId}"]`);
+    if (cardEl) {
+      const bar = cardEl.querySelector('.apk-install-bar');
+      if (bar) {
+        const started = performance.now();
+        const tick = () => {
+          const pct = Math.min(95, ((performance.now() - started) / delay) * 100);
+          bar.style.width = `${pct}%`;
+          if (performance.now() - started < delay) requestAnimationFrame(tick);
+          else bar.style.width = '100%';
+        };
+        requestAnimationFrame(tick);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    apk.status = 'installed';
+    if (data?.packageName) apk.packageName = data.packageName;
+    persistApks();
+    if (state.view === 'repository') renderApks();
+    logConsole(`installed ${apk.fileName ?? apk.name} → ${data?.packageName ?? apk.packageName ?? apk.package}`, 'success');
+    toast(`${apk.name} installed successfully`, 'success');
+  } catch (err) {
+    console.error('[installApk] failed:', err?.message ?? err);
+    apk.status = 'pending';
+    persistApks();
+    if (state.view === 'repository') renderApks();
+    if (err.hostOnline === false) setHostOnline(false);
+    logConsole(`install ${apk.name} failed: ${err?.message ?? 'unknown'}`, 'error');
+    toast(err?.message ?? 'Installation failed', 'error');
+  }
 }
-async function signalExchange(sessionId) {
-  const data = await api(API.signal(), {
-    method: 'POST',
-    body: JSON.stringify({ sessionId, type: 'offer', sdp: 'v=0\r\n' }),
-  });
-  if (!data?.answer?.sdp) throw new Error('Invalid signaling response');
-  return data;
+// ---------------------------------------------------------------------------
+// WebRTC real streaming
+// ---------------------------------------------------------------------------
+function teardownPeerConnection() {
+  if (state.pc) {
+    try { state.pc.close(); } catch (_) {}
+    state.pc = null;
+  }
+  state.remoteStream = null;
+  const video = $('phone-video');
+  if (video) {
+    video.srcObject = null;
+    video.classList.add('hidden');
+  }
 }
 function setLiveIndicator(live) {
   const el = $('live-indicator');
@@ -603,34 +735,104 @@ function updateLastSeen(lastSeen) {
   const ms = new Date(lastSeen).getTime();
   el.textContent = Number.isNaN(ms) ? '—' : new Date(ms).toLocaleTimeString();
 }
-function drawMockCanvas(canvas) {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-  const w = canvas.width, h = canvas.height;
-  let t = 0;
-  if (canvas._mockLoop) cancelAnimationFrame(canvas._mockLoop);
-  const loop = () => {
-    const grad = ctx.createLinearGradient(0, 0, 0, h);
-    grad.addColorStop(0, '#0F172A');
-    grad.addColorStop(1, '#1e3a5f');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, w, h);
-    for (let i = 0; i < 4; i++) {
-      const x = w / 2 + Math.sin(t * 0.02 + i * 1.6) * w * 0.3;
-      const y = h / 2 + Math.cos(t * 0.015 + i * 2.1) * h * 0.25;
-      ctx.beginPath();
-      ctx.arc(x, y, 24 + i * 10, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${i % 2 ? '59,130,246' : '16,185,129'},0.15)`;
-      ctx.fill();
+function showStreamOverlay(text, spinner = true) {
+  const statusEl = $('stream-status');
+  const textEl = $('stream-status-text');
+  const spinEl = statusEl?.querySelector('.loading-spinner');
+  if (statusEl) statusEl.classList.remove('opacity-0', 'pointer-events-none');
+  if (textEl) textEl.textContent = text;
+  if (spinEl) spinEl.classList.toggle('hidden', !spinner);
+}
+function hideStreamOverlay() {
+  $('stream-status')?.classList.add('opacity-0', 'pointer-events-none');
+}
+function setStreamErrorState(message) {
+  const statusEl = $('stream-status');
+  const textEl = $('stream-status-text');
+  const spinEl = statusEl?.querySelector('.loading-spinner');
+  if (statusEl) statusEl.classList.remove('opacity-0', 'pointer-events-none');
+  if (textEl) textEl.textContent = message;
+  if (spinEl) spinEl.classList.add('hidden');
+  setLiveIndicator(false);
+}
+async function startStream() {
+  const inst = state.instances.find((i) => i.status === 'online');
+  const deviceEl = $('session-device');
+  teardownPeerConnection();
+  if (!deviceEl) return;
+  if (!inst || !state.hostOnline) {
+    deviceEl.textContent = '—';
+    setStreamErrorState(state.hostOnline ? 'No online device. Provision a phone first.' : 'Runtime Host not connected.');
+    return;
+  }
+  state.activeSession = inst;
+  state.retryAttempt = 0;
+  deviceEl.textContent = `${inst.name ?? inst.id} · ${inst.id}`;
+  updateLastSeen(inst.lastSeen);
+  logConsole(`adb connect ${inst.id} (Runtime Host)`);
+  await connectWebRTC(inst);
+}
+async function connectWebRTC(inst) {
+  showStreamOverlay('Negotiating WebRTC session…');
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    state.pc = pc;
+    // We only receive video from the host
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.ontrack = (event) => {
+      const video = $('phone-video');
+      if (!video) return;
+      state.remoteStream = event.streams[0] ?? new MediaStream([event.track]);
+      video.srcObject = state.remoteStream;
+      video.classList.remove('hidden');
+      video.play().catch(() => {});
+    };
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      if (s === 'connected' || s === 'completed') {
+        state.retryAttempt = 0;
+        hideStreamOverlay();
+        setLiveIndicator(true);
+        logConsole('WebRTC connected — live video track active', 'success');
+      } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+        setLiveIndicator(false);
+        if (s === 'failed' || s === 'disconnected') {
+          scheduleStreamRetry(inst);
+        }
+      }
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const data = await api(API.signal(), {
+      method: 'POST',
+      body: JSON.stringify({ sessionId: inst.id, type: 'offer', sdp: offer.sdp }),
+    });
+    if (!data?.answer?.sdp) throw new Error('Host returned no SDP answer');
+    await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+  } catch (err) {
+    console.error('[connectWebRTC] failed:', err?.message ?? err);
+    teardownPeerConnection();
+    if (err.hostOnline === false || err.status === 503) {
+      setHostOnline(false);
+      setStreamErrorState('Runtime Host not connected.');
+      logConsole('Runtime Host not connected — stream unavailable', 'error');
+      toast('Runtime Host not connected', 'error');
+    } else {
+      setStreamErrorState('Stream negotiation failed. Use Reconnect to retry.');
+      logConsole(`signaling failed: ${err?.message ?? 'unknown'}`, 'error');
+      scheduleStreamRetry(inst);
     }
-    ctx.fillStyle = 'rgba(226,232,240,0.85)';
-    ctx.font = '600 16px Inter, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('AetherDroid Mock Stream', w / 2, h / 2);
-    t++;
-    canvas._mockLoop = requestAnimationFrame(loop);
-  };
-  loop();
+  }
+}
+function scheduleStreamRetry(inst) {
+  if (state.view !== 'phone') return;
+  const delay = Math.min(15000, 2000 * Math.pow(2, state.retryAttempt++));
+  logConsole(`reconnecting stream in ${Math.round(delay / 1000)}s…`);
+  setTimeout(() => {
+    if (state.view === 'phone' && state.instances.some((i) => i.status === 'online') && state.hostOnline) {
+      connectWebRTC(inst);
+    }
+  }, delay);
 }
 // ---------------------------------------------------------------------------
 // ADB Bridge: input events + keepalive
@@ -649,7 +851,7 @@ function updateLatencyDisplay(rttMs) {
   }
 }
 function sessionReady() {
-  return Boolean(state.activeSession && state.activeSession.status === 'online');
+  return Boolean(state.activeSession && state.activeSession.status === 'online' && state.hostOnline);
 }
 async function sendInput(payload) {
   if (!sessionReady()) return null;
@@ -668,11 +870,16 @@ async function sendInput(payload) {
     updateLatencyDisplay(Math.max(0, performance.now() - started - serverMs));
     return data;
   } catch (err) {
-    console.warn('[sendInput] failed:', err?.message ?? err);
+    if (err.hostOnline === false) setHostOnline(false);
+    // Throttle warnings to once per minute to avoid console spam from heartbeats
+    const now = Date.now();
+    if (now - lastHostWarnAt > 60000) {
+      lastHostWarnAt = now;
+      console.warn('[sendInput] failed:', err?.message ?? err);
+    }
     return null;
   }
 }
-// Periodic keepalive ping to keep lastSeen fresh server-side
 let heartbeatSeq = 0;
 setInterval(() => {
   if (sessionReady()) {
@@ -684,18 +891,12 @@ setInterval(() => {
 // ---------------------------------------------------------------------------
 function wireDropzone(dropEl, inputEl, isRepository) {
   if (!dropEl || !inputEl) return;
-  const handleFile = (file) => {
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith('.apk')) {
-      toast('Only .apk files are supported', 'error');
-      return;
-    }
-    registerApk(file.name, file.size);
-  };
   inputEl.addEventListener('change', () => {
     if (inputEl.files?.length) {
-      handleFile(inputEl.files[0]);
+      const file = inputEl.files[0];
       inputEl.value = '';
+      const sessionId = isRepository ? null : (state.activeSession?.status === 'online' ? state.activeSession.id : null);
+      handleApkUpload(file, { sessionId, showProgress: !isRepository });
     }
   });
   dropEl.addEventListener('click', () => inputEl.click());
@@ -719,17 +920,9 @@ function wireDropzone(dropEl, inputEl, isRepository) {
   );
   dropEl.addEventListener('drop', (e) => {
     const file = e.dataTransfer?.files?.[0];
-    if (!isRepository) {
-      if (file && file.name.toLowerCase().endsWith('.apk')) {
-        const apk = registerApk(file.name, file.size);
-        if (sessionReady()) installApk(apk.id);
-        else toast('Package saved. Connect a device to install.', 'info');
-      } else {
-        toast('Only .apk files are supported', 'error');
-      }
-    } else {
-      handleFile(file);
-    }
+    if (!file) return;
+    const sessionId = isRepository ? null : (state.activeSession?.status === 'online' ? state.activeSession.id : null);
+    handleApkUpload(file, { sessionId, showProgress: !isRepository });
   });
 }
 // ---------------------------------------------------------------------------
@@ -745,7 +938,7 @@ function restoreSession() {
   fetchInstances().then(() => {
     if (saved?.id) {
       const inst = state.instances.find((i) => i.id === saved.id && i.status === 'online');
-      if (inst) {
+      if (inst && state.hostOnline) {
         state.activeSession = inst;
         toast(`Restored session with ${inst.name ?? inst.id}`, 'success');
       } else {
@@ -773,11 +966,12 @@ function setup() {
     sidebar?.classList.add('-translate-x-full');
     backdrop?.classList.add('hidden');
   });
+  $('host-retry')?.addEventListener('click', checkHostStatus);
   $('provision-btn')?.addEventListener('click', provision);
   $('refresh-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     setBtnLoading(btn, true);
-    await Promise.all([fetchInstances(), fetchWatchdog()]);
+    await Promise.all([fetchInstances(), fetchWatchdog(), checkHostStatus()]);
     setBtnLoading(btn, false);
     toast('Synced with Control Plane');
   });
@@ -786,6 +980,10 @@ function setup() {
     if (!btn) return;
     const id = btn.getAttribute('data-id');
     if (btn.classList.contains('connect-btn')) {
+      if (!state.hostOnline) {
+        toast('Runtime Host not connected', 'error');
+        return;
+      }
       const inst = state.instances.find((i) => i.id === id);
       if (inst) {
         try { sessionStorage.setItem('aetherdroid.session', JSON.stringify({ id: inst.id })); } catch (_) { /* non-fatal */ }
@@ -795,7 +993,6 @@ function setup() {
       powerCycle(id, btn.getAttribute('data-action'));
     }
   });
-  // Repository controls
   $('repo-upload-btn')?.addEventListener('click', () => $('repo-apk-input')?.click());
   $('repo-refresh-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
@@ -825,7 +1022,6 @@ function setup() {
       toast(`${apk?.name ?? 'Package'} removed`, 'info');
     }
   });
-  // ADB console toggle
   $('console-toggle')?.addEventListener('click', () => {
     state.consoleOpen = !state.consoleOpen;
     const consoleEl = $('adb-console');
@@ -834,20 +1030,15 @@ function setup() {
     if (chevron) chevron.style.transform = state.consoleOpen ? 'rotate(180deg)' : '';
     $('console-toggle')?.setAttribute('aria-expanded', String(state.consoleOpen));
   });
-  $('reconnect-btn')?.addEventListener('click', () => {
-    const statusEl = $('stream-status');
-    statusEl?.classList.remove('opacity-0', 'pointer-events-none');
-    startStream();
-  });
+  $('reconnect-btn')?.addEventListener('click', () => startStream());
   $('end-session-btn')?.addEventListener('click', () => {
+    teardownPeerConnection();
     state.activeSession = null;
     latencySamples = [];
     setLiveIndicator(false);
     try { sessionStorage.removeItem('aetherdroid.session'); } catch (_) { /* non-fatal */ }
     if ($('latency-value')) $('latency-value').textContent = '--ms';
-    const statusEl = $('stream-status');
-    statusEl?.classList.remove('opacity-0', 'pointer-events-none');
-    if ($('stream-status-text')) $('stream-status-text').textContent = 'Session ended.';
+    setStreamErrorState('Session ended.');
     if ($('session-device')) $('session-device').textContent = '—';
     logConsole('adb disconnect', 'error');
     toast('Session ended');
@@ -872,25 +1063,25 @@ function setup() {
     kbBtn.classList.toggle('text-white', state.keyboardCapture);
     kbBtn.classList.toggle('bg-slate-800', !state.keyboardCapture);
     kbBtn.classList.toggle('text-slate-400', !state.keyboardCapture);
-    toast(state.keyboardCapture
-      ? 'Keyboard capture on — physical keys route to device'
-      : 'Keyboard capture off', 'info');
+    toast(state.keyboardCapture ? 'Keyboard capture on — physical keys route to device' : 'Keyboard capture off', 'info');
   });
   document.addEventListener('keydown', (e) => {
     if (!state.keyboardCapture || !sessionReady()) return;
     if (e.target instanceof HTMLElement && ['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
     if (emitKeyboard(e)) e.preventDefault();
   });
-  // Hydrate local session APKs immediately, then fetch server state
   const local = apksForSession();
   if (local.length) {
     state.apks = local;
     renderApks();
   }
-  logConsole('control plane bridge initialized');
-  fetchWatchdog();
-  setInterval(fetchWatchdog, 15000);
-  restoreSession();
+  logConsole('control plane bridge initialized — real APK pipeline active');
+  checkHostStatus().then(() => {
+    fetchWatchdog();
+    setInterval(fetchWatchdog, 15000);
+    setInterval(checkHostStatus, 30000);
+    restoreSession();
+  });
   const clock = $('clock');
   const updateClock = () => {
     if (clock) clock.textContent = new Date().toLocaleTimeString();
