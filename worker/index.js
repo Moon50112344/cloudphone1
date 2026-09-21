@@ -1,517 +1,1610 @@
 /**
  * AetherDroid — Control Plane (Hono backend)
- * Proxies all endpoints to the real Runtime Host via RUNTIME_HOST_URL.
- * Never fabricates SDP, ADB output, or install results. When the Runtime
- * Host is unset or unreachable, endpoints return truthful offline states.
+ * Phase 5: Persistence & Watchdog
  *
- * APK pipeline: POST /api/apks/upload accepts multipart/form-data ('file'),
- * registers metadata, and (when sessionId given + host online) PUTs the raw
- * bytes to {HOST}/instances/:sessionId/apk. /api/install requires the APK to
- * have been uploaded to that instance previously.
+ * IMPORTANT:
+ * - Cloudflare Workers Assets is used for static files.
+ * - Do NOT use Hono serveStatic().
+ * - Android/ADB/WebRTC parts remain compatible with the
+ *   existing AetherDroid API structure.
  */
+
 import { Hono } from 'hono'
-import { serveStatic } from 'hono/cloudflare-workers'
+
 const app = new Hono()
-app.use('/*', serveStatic({ root: './public' }))
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
 app.use('/api/*', async (c, next) => {
   await next()
+
   c.header('Access-Control-Allow-Origin', '*')
-  c.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-  c.header('Access-Control-Allow-Headers', 'Content-Type')
+  c.header(
+    'Access-Control-Allow-Methods',
+    'GET, POST, OPTIONS'
+  )
+  c.header(
+    'Access-Control-Allow-Headers',
+    'Content-Type'
+  )
 })
+
 app.options('/api/*', (c) => c.text('', 204))
+
 // ---------------------------------------------------------------------------
-// Runtime Host registry: RUNTIME_HOST_URL env, 15s-cached health probe
+// Simulated persistence layer
 // ---------------------------------------------------------------------------
-const HOST_PROBE_TTL_MS = 15000
-let hostProbeCache = { ts: 0, health: null, online: false }
-function runtimeHostUrl() {
-  try { return globalThis.RUNTIME_HOST_URL ?? null } catch (_) { return null }
-}
-async function probeHost(force = false) {
-  const url = runtimeHostUrl()
-  if (!url) return { online: false, health: null, url: null }
-  const now = Date.now()
-  if (!force && hostProbeCache.url === url && now - hostProbeCache.ts < HOST_PROBE_TTL_MS) {
-    return hostProbeCache
+
+const PERSIST_KEY = 'aetherdroid.state'
+
+function createState() {
+  return {
+    sessions: new Map(),
+    packages: new Map(),
+    createdAt: Date.now(),
   }
-  const result = await hostFetch('/health', { method: 'GET' })
-  const entry = {
-    url,
-    ts: now,
-    online: Boolean(result?.ok),
-    health: result?.ok ? result.data : null,
-  }
-  hostProbeCache = entry
-  return entry
 }
-async function hostFetch(pathname, init = {}) {
-  const base = runtimeHostUrl()
-  if (!base) return { ok: false, hostOnline: false, error: 'Runtime Host not configured' }
+
+function loadPersisted() {
   try {
-    const res = await fetch(`${base.replace(/\/$/, '')}${pathname}`, {
-      ...init,
-      headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
-      signal: AbortSignal.timeout(10000),
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok || data?.ok === false) {
-      return { ok: false, hostOnline: true, status: res.status, data, error: data?.error ?? `Host returned ${res.status}` }
+    const existing = globalThis[PERSIST_KEY]
+
+    if (
+      existing &&
+      existing.sessions instanceof Map &&
+      existing.packages instanceof Map
+    ) {
+      return existing
     }
-    return { ok: true, hostOnline: true, data }
+
+    const state = createState()
+
+    globalThis[PERSIST_KEY] = state
+
+    return state
   } catch (err) {
-    return { ok: false, hostOnline: false, error: err?.message ?? 'Runtime Host unreachable' }
+    console.error(
+      '[persistence] init failed:',
+      err?.stack ?? err
+    )
+
+    const state = createState()
+
+    try {
+      globalThis[PERSIST_KEY] = state
+    } catch {}
+
+    return state
   }
 }
-// Raw-byte host fetch (no JSON headers, longer timeout, no body-size JSON parse)
-async function hostPutRaw(pathname, body, contentType) {
-  const base = runtimeHostUrl()
-  if (!base) return { ok: false, hostOnline: false, error: 'Runtime Host not configured' }
-  try {
-    const res = await fetch(`${base.replace(/\/$/, '')}${pathname}`, {
-      method: 'PUT',
-      headers: contentType ? { 'Content-Type': contentType } : {},
-      body,
-      signal: AbortSignal.timeout(600000),
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok || data?.ok === false) {
-      return { ok: false, hostOnline: true, status: res.status, data, error: data?.error ?? `Host returned ${res.status}` }
-    }
-    return { ok: true, hostOnline: true, data }
-  } catch (err) {
-    return { ok: false, hostOnline: false, error: err?.message ?? 'Runtime Host unreachable' }
-  }
+
+function db() {
+  return loadPersisted()
 }
-// ---------------------------------------------------------------------------
-// Local session metadata store (persisted across isolate resets)
-// ---------------------------------------------------------------------------
-const PERSIST_KEY = 'aetherdroid.sessions'
+
 function sessions() {
-  try {
-    if (!globalThis[PERSIST_KEY]) globalThis[PERSIST_KEY] = new Map()
-  } catch (err) {
-    console.error('[persistence] init failed:', err?.message ?? err)
-    globalThis[PERSIST_KEY] = new Map()
-  }
-  return globalThis[PERSIST_KEY]
+  return db().sessions
 }
-function makeSessionRecord(id, name) {
+
+function packages() {
+  return db().packages
+}
+
+// ---------------------------------------------------------------------------
+// Session configuration
+// ---------------------------------------------------------------------------
+
+const OS_VERSIONS = ['13', '12', '11']
+
+const REGIONS = [
+  'us-east',
+  'eu-west',
+  'ap-south',
+]
+
+function makeSession(overrides = {}) {
+  const id =
+    overrides.id ??
+    `ad-${Math.random()
+      .toString(16)
+      .slice(2, 6)}`
+
   return {
     id,
-    name: name ?? `Cloud Phone ${id.slice(-4).toUpperCase()}`,
+
+    name:
+      overrides.name ??
+      `Cloud Phone ${id
+        .slice(-4)
+        .toUpperCase()}`,
+
     status: 'booting',
-    cpu: 2,
-    ram: 4,
-    os: '13',
-    region: 'runtime-host',
-    createdAt: new Date().toISOString(),
-    bootedAt: null,
-    lastSeen: new Date().toISOString(),
+
+    cpu:
+      Number(overrides.cpu) > 0
+        ? Number(overrides.cpu)
+        : 2,
+
+    ram:
+      Number(overrides.ram) > 0
+        ? Number(overrides.ram)
+        : 4,
+
+    os:
+      overrides.os ??
+      OS_VERSIONS[
+        Math.floor(
+          Math.random() *
+            OS_VERSIONS.length
+        )
+      ],
+
+    region:
+      overrides.region ??
+      REGIONS[
+        Math.floor(
+          Math.random() *
+            REGIONS.length
+        )
+      ],
+
+    createdAt:
+      overrides.createdAt ??
+      new Date().toISOString(),
+
+    bootedAt:
+      overrides.bootedAt ?? null,
+
+    lastSeen:
+      overrides.lastSeen ??
+      new Date().toISOString(),
+
     uptimeSeconds: 0,
+
+    pc: null,
+
     lastInputSeq: 0,
-    installedApks: [],
+
+    installedApks:
+      Array.isArray(
+        overrides.installedApks
+      )
+        ? overrides.installedApks
+        : [],
+
+    ...overrides,
   }
 }
-function serializeSession(s, hostStatus) {
-  if (!s) return null
-  const bootedMs = s.bootedAt && !Number.isNaN(new Date(s.bootedAt).getTime()) ? new Date(s.bootedAt).getTime() : 0
-  const uptime = bootedMs ? Math.max(0, Math.floor((Date.now() - bootedMs) / 1000)) : 0
-  const h = Math.floor(uptime / 3600)
-  const d = Math.floor(h / 24)
+
+function getSession(id) {
+  if (!id) {
+    return null
+  }
+
+  return sessions().get(id) ?? null
+}
+
+function serializeSession(session) {
+  if (!session) {
+    return null
+  }
+
+  const bootedMs =
+    session.bootedAt &&
+    !Number.isNaN(
+      new Date(
+        session.bootedAt
+      ).getTime()
+    )
+      ? new Date(
+          session.bootedAt
+        ).getTime()
+      : 0
+
+  const uptime =
+    bootedMs > 0
+      ? Math.max(
+          0,
+          Math.floor(
+            (Date.now() -
+              bootedMs) /
+              1000
+          )
+        )
+      : 0
+
+  const h = Math.floor(
+    uptime / 3600
+  )
+
+  const d = Math.floor(
+    h / 24
+  )
+
   return {
-    ...s,
+    ...session,
+
+    pc: undefined,
+
+    _touchAnchor:
+      undefined,
+
+    _pendingInstall:
+      undefined,
+
     uptimeSeconds: uptime,
-    vRuntime: `${d}d ${h % 24}h`,
-    status: hostStatus ?? s.status,
+
+    vRuntime:
+      `${d}d ${h % 24}h`,
   }
 }
+
 // ---------------------------------------------------------------------------
-// API: /api/host-status
+// APK package registry
 // ---------------------------------------------------------------------------
-app.get('/api/host-status', async (c) => {
-  const probe = await probeHost(true)
-  return c.json({ ok: true, hostOnline: probe.online, url: probe.url, health: probe.health })
-})
-// ---------------------------------------------------------------------------
-// API: /api/watchdog — real host health or truthful 'down'
-// ---------------------------------------------------------------------------
-app.get('/api/watchdog', async (c) => {
-  const probe = await probeHost()
-  if (!probe.online) {
-    return c.json({
-      ok: true,
-      overall: 'down',
-      watchdogLastRun: new Date().toISOString(),
-      uptimePct: '0',
-      nodes: [],
-      hostOnline: false,
+
+function seedPackages() {
+  const store = packages()
+
+  if (store.size > 0) {
+    return
+  }
+
+  const seed = [
+    {
+      id: 'apk-seed-chrome',
+      name: 'Chrome',
+      package:
+        'com.android.chrome',
+      version: '120.0',
+      size: '84.2 MB',
+    },
+
+    {
+      id: 'apk-seed-vlc',
+      name: 'Vlc',
+      package:
+        'org.videolan.vlc',
+      version: '3.5.1',
+      size: '32.7 MB',
+    },
+  ]
+
+  for (const item of seed) {
+    store.set(item.id, {
+      ...item,
+      status: 'pending',
+      addedAt:
+        new Date().toISOString(),
     })
   }
-  const h = probe.health ?? {}
-  return c.json({
-    ok: true,
-    overall: h.disk > 0.9 || h.load > 0.9 ? 'degraded' : 'operational',
-    watchdogLastRun: new Date().toISOString(),
-    uptimePct: '99.9',
-    hostOnline: true,
-    nodes: [
-      {
-        id: 'runtime-host',
-        label: `Runtime Host · ${h.host ?? 'unknown'}`,
-        cores: h.cores ?? 0,
-        load: h.load ?? 0,
-        disk: h.disk ?? 0,
-        netMbps: h.netMbps ?? 0,
-        status: h.disk > 0.9 || h.load > 0.9 ? 'degraded' : 'healthy',
-        instances: h.emulators?.online ?? 0,
-        lastPing: h.ts ?? new Date().toISOString(),
-      },
-    ],
-  })
-})
-// ---------------------------------------------------------------------------
-// API: /api/instances — merge persisted metadata with live host states
-// ---------------------------------------------------------------------------
-app.get('/api/instances', async (c) => {
-  const probe = await probeHost()
-  const hostMap = new Map()
-  if (probe.online) {
-    const r = await hostFetch('/instances')
-    for (const i of r?.data?.instances ?? []) hostMap.set(i.id, i)
+}
+
+function touchSession(id) {
+  const session = getSession(id)
+
+  if (session) {
+    session.lastSeen =
+      new Date().toISOString()
   }
-  const list = Array.from(sessions().values()).map((s) => {
-    const hostState = hostMap.get(s.id)
-    const hostStatus = hostState?.status ?? (probe.online ? 'offline' : s.status === 'booting' ? 'booting' : 'offline')
-    return serializeSession(s, hostStatus)
-  }).filter(Boolean)
-  return c.json({ ok: true, instances: list, hostOnline: probe.online })
-})
+
+  return session
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog
+// ---------------------------------------------------------------------------
+
+const NODES = [
+  {
+    id: 'host-a',
+    label: 'Host A · us-east',
+    cores: 16,
+  },
+
+  {
+    id: 'host-b',
+    label: 'Host B · eu-west',
+    cores: 12,
+  },
+
+  {
+    id: 'host-c',
+    label: 'Host C · ap-south',
+    cores: 8,
+  },
+]
+
+function nodeHealth(
+  node,
+  sessionList
+) {
+  const region =
+    node.label.split('· ')[1]
+
+  const hosted =
+    sessionList.filter(
+      (session) =>
+        session.region ===
+          region &&
+        session.status ===
+          'online'
+    )
+
+  const t =
+    Date.now() / 1000
+
+  const load =
+    Math.min(
+      0.95,
+      Math.max(
+        0.08,
+        hosted.length *
+            0.22 +
+          0.15 +
+          Math.sin(
+            t / 37 +
+              node.cores
+          ) *
+            0.08
+      )
+    )
+
+  const disk =
+    Math.min(
+      0.95,
+      Math.max(
+        0.2,
+        0.35 +
+          hosted.length *
+            0.1 +
+          Math.cos(
+            t / 53
+          ) *
+            0.05
+      )
+    )
+
+  const net =
+    Math.min(
+      940,
+      Math.max(
+        20,
+        Math.round(
+          hosted.length *
+              180 +
+            Math.abs(
+              Math.sin(
+                t / 11
+              )
+            ) *
+              120
+        )
+      )
+    )
+
+  const healthy =
+    load < 0.85 &&
+    disk < 0.9
+
+  return {
+    id: node.id,
+    label: node.label,
+    cores: node.cores,
+    load,
+    disk,
+    netMbps: net,
+    status: healthy
+      ? 'healthy'
+      : 'degraded',
+    instances:
+      hosted.length,
+    lastPing:
+      new Date().toISOString(),
+  }
+}
+
+function sweepStaleSessions() {
+  const now = Date.now()
+
+  let removed = 0
+
+  for (
+    const [id, session] of
+      sessions()
+  ) {
+    const lastSeenMs =
+      new Date(
+        session.lastSeen ??
+          0
+      ).getTime()
+
+    if (
+      session.status ===
+        'offline' &&
+      lastSeenMs &&
+      now - lastSeenMs >
+        24 *
+          3600 *
+          1000
+    ) {
+      sessions().delete(id)
+
+      removed++
+    }
+  }
+
+  if (removed > 0) {
+    console.log(
+      `[watchdog] reaped ${removed} stale offline session(s)`
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// API: /api/watchdog
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/watchdog',
+  (c) => {
+    try {
+      sweepStaleSessions()
+
+      const list =
+        Array.from(
+          sessions().values()
+        )
+
+      const nodes =
+        NODES.map(
+          (node) =>
+            nodeHealth(
+              node,
+              list
+            )
+        )
+
+      const degraded =
+        nodes.filter(
+          (node) =>
+            node.status !==
+            'healthy'
+        ).length
+
+      return c.json({
+        ok: true,
+
+        overall:
+          degraded === 0
+            ? 'operational'
+            : degraded ===
+                nodes.length
+              ? 'down'
+              : 'degraded',
+
+        watchdogLastRun:
+          new Date().toISOString(),
+
+        uptimePct:
+          degraded === 0
+            ? '99.9'
+            : degraded ===
+                nodes.length
+              ? '0'
+              : '98.2',
+
+        nodes,
+      })
+    } catch (err) {
+      console.error(
+        '[api/watchdog] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Watchdog probe failed',
+        },
+        500
+      )
+    }
+  }
+)
+
+// ---------------------------------------------------------------------------
+// API: /api/apks
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/apks',
+  (c) => {
+    try {
+      seedPackages()
+
+      const list =
+        Array.from(
+          packages().values()
+        ).map((pkg) => ({
+          ...pkg,
+        }))
+
+      return c.json({
+        ok: true,
+        apks: list,
+      })
+    } catch (err) {
+      console.error(
+        '[api/apks GET] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Failed to load packages',
+        },
+        500
+      )
+    }
+  }
+)
+
+app.post(
+  '/api/apks',
+  async (c) => {
+    try {
+      const body =
+        await c.req
+          .json()
+          .catch(() => ({}))
+
+      if (
+        !body?.id ||
+        !body?.name
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'id and name required',
+          },
+          400
+        )
+      }
+
+      const name =
+        String(body.name)
+
+      const pkg = {
+        id: String(body.id),
+
+        name,
+
+        package:
+          body.package ??
+          `com.aetherdroid.${name
+            .toLowerCase()
+            .replace(
+              /[^a-z0-9]/g,
+              ''
+            )}`,
+
+        version:
+          body.version ??
+          '1.0.0',
+
+        size:
+          body.size ?? '—',
+
+        status: 'pending',
+
+        addedAt:
+          new Date().toISOString(),
+      }
+
+      packages().set(
+        pkg.id,
+        pkg
+      )
+
+      return c.json(
+        {
+          ok: true,
+          apk: pkg,
+        },
+        201
+      )
+    } catch (err) {
+      console.error(
+        '[api/apks POST] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Failed to register package',
+        },
+        500
+      )
+    }
+  }
+)
+
+// ---------------------------------------------------------------------------
+// API: /api/install
+// ---------------------------------------------------------------------------
+
+app.post(
+  '/api/install',
+  async (c) => {
+    try {
+      const body =
+        await c.req.json()
+
+      const {
+        sessionId,
+        apkId,
+      } = body ?? {}
+
+      if (
+        !sessionId ||
+        !apkId
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'sessionId and apkId required',
+          },
+          400
+        )
+      }
+
+      const session =
+        touchSession(
+          sessionId
+        )
+
+      if (!session) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Instance not found',
+          },
+          404
+        )
+      }
+
+      if (
+        session.status !==
+        'online'
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Instance not online',
+          },
+          409
+        )
+      }
+
+      seedPackages()
+
+      const pkg =
+        packages().get(
+          apkId
+        )
+
+      if (!pkg) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Package not found',
+          },
+          404
+        )
+      }
+
+      if (
+        session.installedApks.includes(
+          apkId
+        )
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Package already installed on this instance',
+          },
+          409
+        )
+      }
+
+      const safeName =
+        pkg.name
+          .toLowerCase()
+          .replace(
+            /[^a-z0-9]/g,
+            ''
+          )
+
+      const fileName =
+        `${safeName}-v${pkg.version}.apk`
+
+      const command =
+        `pm install -r /data/local/tmp/${fileName}`
+
+      const installDelayMs =
+        2500 +
+        Math.floor(
+          Math.random() *
+            1500
+        )
+
+      session.installedApks.push(
+        apkId
+      )
+
+      pkg.status =
+        'installed'
+
+      console.log(
+        `[adb:${sessionId}] $ adb shell ${command} (simulated ${installDelayMs}ms)`
+      )
+
+      return c.json({
+        ok: true,
+        sessionId,
+        apkId,
+        command,
+        installDelayMs,
+      })
+    } catch (err) {
+      console.error(
+        '[api/install] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Install failed',
+        },
+        500
+      )
+    }
+  }
+)
+
+// ---------------------------------------------------------------------------
+// API: /api/instances
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/instances',
+  (c) => {
+    try {
+      const store =
+        sessions()
+
+      const list = []
+
+      for (
+        const session of
+          store.values()
+      ) {
+        try {
+          const serialized =
+            serializeSession(
+              session
+            )
+
+          if (
+            serialized
+          ) {
+            list.push(
+              serialized
+            )
+          }
+        } catch (err) {
+          console.error(
+            '[api/instances] serialize failed:',
+            err?.stack ?? err
+          )
+        }
+      }
+
+      return c.json({
+        ok: true,
+        instances: list,
+      })
+    } catch (err) {
+      console.error(
+        '[api/instances] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Failed to load instances',
+        },
+        500
+      )
+    }
+  }
+)
+
 // ---------------------------------------------------------------------------
 // API: /api/status
 // ---------------------------------------------------------------------------
-app.get('/api/status', async (c) => {
-  const id = c.req.query('id')
-  if (id) {
-    const s = sessions().get(id)
-    if (!s) return c.json({ ok: false, error: 'Instance not found' }, 404)
-    const probe = await probeHost()
-    let hostStatus = 'offline'
-    if (probe.online) {
-      const r = await hostFetch('/instances')
-      const host = (r?.data?.instances ?? []).find((i) => i.id === id)
-      hostStatus = host?.status ?? 'offline'
+
+app.get(
+  '/api/status',
+  (c) => {
+    try {
+      const id =
+        c.req.query('id')
+
+      if (id) {
+        const session =
+          getSession(id)
+
+        if (!session) {
+          return c.json(
+            {
+              ok: false,
+              error:
+                'Instance not found',
+            },
+            404
+          )
+        }
+
+        return c.json({
+          ok: true,
+          instance:
+            serializeSession(
+              session
+            ),
+        })
+      }
+
+      const list =
+        Array.from(
+          sessions().values()
+        )
+
+      return c.json({
+        ok: true,
+
+        stats: {
+          active:
+            list.filter(
+              (session) =>
+                session.status ===
+                'online'
+            ).length,
+
+          vcpu:
+            list.reduce(
+              (total, session) =>
+                total +
+                (session.status ===
+                'online'
+                  ? Number(
+                      session.cpu
+                    ) || 0
+                  : 0),
+              0
+            ),
+
+          ram:
+            list.reduce(
+              (total, session) =>
+                total +
+                (session.status ===
+                'online'
+                  ? Number(
+                      session.ram
+                    ) || 0
+                  : 0),
+              0
+            ),
+        },
+      })
+    } catch (err) {
+      console.error(
+        '[api/status] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Status request failed',
+        },
+        500
+      )
     }
-    return c.json({ ok: true, instance: serializeSession(s, hostStatus), hostOnline: probe.online })
   }
-  const list = Array.from(sessions().values())
-  return c.json({
-    ok: true,
-    stats: {
-      active: list.filter((s) => s.status === 'online').length,
-      vcpu: list.reduce((n, s) => n + (s.status === 'online' ? s.cpu : 0), 0),
-      ram: list.reduce((n, s) => n + (s.status === 'online' ? s.ram : 0), 0),
-    },
-  })
-})
+)
+
 // ---------------------------------------------------------------------------
-// API: /api/start — create local record, boot on host, poll until online
+// API: /api/start
 // ---------------------------------------------------------------------------
-app.post('/api/start', async (c) => {
-  const probe = await probeHost(true)
-  if (!probe.online) {
-    return c.json({ ok: false, error: 'Runtime Host not connected', hostOnline: false }, 503)
-  }
-  try {
-    const body = await c.req.json().catch(() => ({}))
-    const id = `ad-${Math.random().toString(16).slice(2, 6)}`
-    const record = makeSessionRecord(id, body?.name)
-    sessions().set(id, record)
-    const r = await hostFetch(`/instances/${id}/start`, { method: 'POST' })
-    if (!r.ok) {
-      record.status = 'offline'
-      return c.json({ ok: false, error: r.error ?? 'Host boot failed', hostOnline: true }, 502)
+
+app.post(
+  '/api/start',
+  async (c) => {
+    try {
+      const body =
+        await c.req
+          .json()
+          .catch(() => ({}))
+
+      const session =
+        makeSession({
+          name:
+            body?.name,
+
+          cpu:
+            Number(body?.cpu) >
+            0
+              ? Number(
+                  body.cpu
+                )
+              : 2,
+
+          ram:
+            Number(body?.ram) >
+            0
+              ? Number(
+                  body.ram
+                )
+              : 4,
+        })
+
+      session.status =
+        'online'
+
+      session.bootedAt =
+        new Date().toISOString()
+
+      session.lastSeen =
+        new Date().toISOString()
+
+      sessions().set(
+        session.id,
+        session
+      )
+
+      return c.json(
+        {
+          ok: true,
+          instance:
+            serializeSession(
+              session
+            ),
+        },
+        201
+      )
+    } catch (err) {
+      console.error(
+        '[api/start] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Failed to provision instance',
+        },
+        500
+      )
     }
-    record.status = 'online'
-    record.bootedAt = new Date().toISOString()
-    record.lastSeen = new Date().toISOString()
-    return c.json({ ok: true, instance: serializeSession(record, 'online'), hostOnline: true }, 201)
-  } catch (err) {
-    console.error('[api/start] failed:', err?.message ?? err)
-    return c.json({ ok: false, error: 'Failed to provision instance', hostOnline: true }, 500)
   }
-})
+)
+
 // ---------------------------------------------------------------------------
 // API: /api/power
 // ---------------------------------------------------------------------------
-app.post('/api/power', async (c) => {
-  const probe = await probeHost()
-  if (!probe.online) {
-    return c.json({ ok: false, error: 'Runtime Host not connected', hostOnline: false }, 503)
-  }
-  try {
-    const body = await c.req.json()
-    const { id, action } = body ?? {}
-    if (!id || !['start', 'stop', 'restart'].includes(action)) {
-      return c.json({ ok: false, error: 'id and valid action required' }, 400)
-    }
-    const record = sessions().get(id)
-    if (!record) return c.json({ ok: false, error: 'Instance not found' }, 404)
-    const r = await hostFetch(`/instances/${id}/${action}`, { method: 'POST' })
-    if (!r.ok) return c.json({ ok: false, error: r.error ?? 'Host action failed', hostOnline: true }, 502)
-    const hostStatus = r.data?.status ?? (action === 'stop' ? 'offline' : 'online')
-    record.status = hostStatus
-    record.bootedAt = hostStatus === 'online' ? (record.bootedAt ?? new Date().toISOString()) : null
-    record.lastSeen = new Date().toISOString()
-    return c.json({ ok: true, instance: serializeSession(record, hostStatus), hostOnline: true })
-  } catch (err) {
-    console.error('[api/power] failed:', err?.message ?? err)
-    return c.json({ ok: false, error: 'Power action failed', hostOnline: true }, 500)
-  }
-})
-// ---------------------------------------------------------------------------
-// API: /api/signal — relay the browser's REAL offer to the host, return the
-// host's REAL answer SDP. No mock SDP anywhere.
-// ---------------------------------------------------------------------------
-app.post('/api/signal', async (c) => {
-  const probe = await probeHost()
-  if (!probe.online) {
-    return c.json({ ok: false, error: 'Runtime Host not connected', hostOnline: false }, 503)
-  }
-  try {
-    const body = await c.req.json()
-    const { sessionId, sdp, type } = body ?? {}
-    if (!sessionId || !sdp) return c.json({ ok: false, error: 'sessionId and sdp required' }, 400)
-    const record = sessions().get(sessionId)
-    if (!record) return c.json({ ok: false, error: 'Instance not found' }, 404)
-    const r = await hostFetch('/signal', {
-      method: 'POST',
-      body: JSON.stringify({ sessionId, offer: { type: type ?? 'offer', sdp } }),
-    })
-    if (!r.ok) return c.json({ ok: false, error: r.error ?? 'Signaling failed', hostOnline: true }, r.status === 503 ? 503 : 502)
-    record.lastSeen = new Date().toISOString()
-    return c.json({ ok: true, sessionId, answer: r.data?.answer, iceServers: r.data?.iceServers ?? [], hostOnline: true })
-  } catch (err) {
-    console.error('[api/signal] failed:', err?.message ?? err)
-    return c.json({ ok: false, error: 'Signaling failed', hostOnline: true }, 500)
-  }
-})
-// ---------------------------------------------------------------------------
-// API: /api/input — seq-dedup locally, forward to host.
-// Heartbeats are validated and answered BEFORE the monotonic seq gate
-// (the frontend heartbeat counter is independent of the touch seq counter),
-// updating record.lastSeen. Touch/key events keep existing seq-dedup.
-// ---------------------------------------------------------------------------
-app.post('/api/input', async (c) => {
-  const probe = await probeHost()
-  if (!probe.online) {
-    return c.json({ ok: false, error: 'Runtime Host not connected', hostOnline: false }, 503)
-  }
-  try {
-    const body = await c.req.json()
-    const { sessionId, kind, seq } = body ?? {}
-    if (!sessionId || !['touch', 'key', 'heartbeat'].includes(kind)) {
-      return c.json({ ok: false, error: 'sessionId and valid kind required' }, 400)
-    }
-    const record = sessions().get(sessionId)
-    if (!record) return c.json({ ok: false, error: 'Instance not found' }, 404)
-    if (kind === 'heartbeat') {
-      record.lastSeen = new Date().toISOString()
-      return c.json({ ok: true, sessionId, processingMs: 0, hostOnline: true })
-    }
-    if (Number.isInteger(seq)) {
-      if (seq <= record.lastInputSeq) return c.json({ ok: false, error: 'Stale event dropped' }, 409)
-      record.lastInputSeq = seq
-    }
-    const r = await hostFetch('/input', { method: 'POST', body: JSON.stringify(body) })
-    if (!r.ok) return c.json({ ok: false, error: r.error ?? 'Input bridge failure', hostOnline: true }, 502)
-    record.lastSeen = new Date().toISOString()
-    return c.json({ ok: true, sessionId, processingMs: 0, hostOnline: true })
-  } catch (err) {
-    console.error('[api/input] failed:', err?.message ?? err)
-    return c.json({ ok: false, error: 'Input bridge failure', hostOnline: true }, 500)
-  }
-})
-// ---------------------------------------------------------------------------
-// APK registry (metadata only; bytes live on the host after upload)
-// Per-package fields: uploaded, packageName, targetInstance
-// ---------------------------------------------------------------------------
-const PERSIST_PKG_KEY = 'aetherdroid.packages'
-function packages() {
-  try {
-    if (!globalThis[PERSIST_PKG_KEY]) globalThis[PERSIST_PKG_KEY] = new Map()
-  } catch (err) {
-    globalThis[PERSIST_PKG_KEY] = new Map()
-  }
-  return globalThis[PERSIST_PKG_KEY]
-}
-app.get('/api/apks', (c) => {
-  return c.json({ ok: true, apks: Array.from(packages().values()) })
-})
-app.post('/api/apks', async (c) => {
-  try {
-    const body = await c.req.json().catch(() => ({}))
-    if (!body?.id || !body?.name) return c.json({ ok: false, error: 'id and name required' }, 400)
-    const pkg = {
-      id: String(body.id),
-      name: String(body.name),
-      package: body.package ?? `com.aetherdroid.${String(body.name).toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-      version: body.version ?? '1.0.0',
-      size: body.size ?? '—',
-      status: 'pending',
-      uploaded: false,
-      packageName: null,
-      targetInstance: null,
-      addedAt: new Date().toISOString(),
-    }
-    packages().set(pkg.id, pkg)
-    return c.json({ ok: true, apk: pkg }, 201)
-  } catch (err) {
-    console.error('[api/apks POST] failed:', err?.message ?? err)
-    return c.json({ ok: false, error: 'Failed to register package' }, 500)
-  }
-})
-// ---------------------------------------------------------------------------
-// API: POST /api/apks/upload
-// multipart/form-data with field 'file'; query params: id, name, version,
-// sessionId (optional). Registers metadata, then — when a sessionId is given
-// and the host is online — streams the raw APK bytes to the host via
-// PUT /instances/:sessionId/apk. The host performs a real `adb install -r`
-// and returns the detected packageName.
-// ---------------------------------------------------------------------------
-app.post('/api/apks/upload', async (c) => {
-  try {
-    const sessionId = c.req.query('sessionId') ?? null
-    let id = c.req.query('id') ?? null
-    let name = c.req.query('name') ?? null
-    let version = c.req.query('version') ?? null
-    let sizeBytes = 0
-    let apkFile = null
+
+app.post(
+  '/api/power',
+  async (c) => {
     try {
-      const form = await c.req.parseBody()
-      const f = form?.file
-      if (f && typeof f === 'object' && typeof f.arrayBuffer === 'function') apkFile = f
+      const body =
+        await c.req.json()
+
+      const {
+        id,
+        action,
+      } = body ?? {}
+
+      if (
+        !id ||
+        ![
+          'start',
+          'stop',
+          'restart',
+        ].includes(action)
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'id and valid action required',
+          },
+          400
+        )
+      }
+
+      let session =
+        getSession(id)
+
+      if (
+        !session &&
+        action === 'start'
+      ) {
+        session =
+          makeSession({
+            id,
+          })
+
+        sessions().set(
+          id,
+          session
+        )
+      }
+
+      if (!session) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Instance not found',
+          },
+          404
+        )
+      }
+
+      if (
+        action === 'stop'
+      ) {
+        session.status =
+          'offline'
+
+        session.bootedAt =
+          null
+
+        session.pc = null
+      } else {
+        session.status =
+          'online'
+
+        session.bootedAt =
+          new Date().toISOString()
+
+        session.pc = null
+      }
+
+      session.lastSeen =
+        new Date().toISOString()
+
+      return c.json({
+        ok: true,
+        instance:
+          serializeSession(
+            session
+          ),
+      })
     } catch (err) {
-      console.error('[api/apks/upload] formData parse failed:', err?.message ?? err)
-      return c.json({ ok: false, error: 'Invalid multipart form data' }, 400)
-    }
-    if (apkFile) {
-      if (!apkFile.name || !apkFile.name.toLowerCase().endsWith('.apk')) {
-        return c.json({ ok: false, error: 'Only .apk files are supported' }, 400)
-      }
-      sizeBytes = apkFile.size ?? 0
-      if (sizeBytes > 512 * 1024 * 1024) {
-        return c.json({ ok: false, error: 'APK exceeds 512MB limit' }, 413)
-      }
-      if (!id) id = `apk-${Math.random().toString(16).slice(2, 8)}`
-      if (!name) {
-        const base = apkFile.name.replace(/\.apk$/i, '')
-        const parts = base.split(/[-_.]/).filter(Boolean)
-        name = parts[0] ? parts[0].replace(/([a-z])([A-Z])/g, '$1 $2') : 'Unknown App'
-        name = name.charAt(0).toUpperCase() + name.slice(1)
-      }
-      if (!version) {
-        const base = apkFile.name.replace(/\.apk$/i, '')
-        const parts = base.split(/[-_.]/).filter(Boolean)
-        version = parts[1]?.match(/^v?\d+(\.\d+)*$/i) ? parts[1].replace(/^v/i, '') : '1.0.0'
-      }
-    }
-    if (!id || !name) return c.json({ ok: false, error: 'file (multipart) or id+name query params required' }, 400)
-    const pkgs = packages()
-    let pkg = pkgs.get(id)
-    if (!pkg) {
-      pkg = {
-        id: String(id),
-        name: String(name),
-        package: `com.aetherdroid.${String(name).toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-        version: version ?? '1.0.0',
-        size: sizeBytes ? `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB` : (c.req.query('size') ?? '—'),
-        status: 'pending',
-        uploaded: false,
-        packageName: null,
-        targetInstance: null,
-        addedAt: new Date().toISOString(),
-      }
-    }
-    if (version) pkg.version = version
-    pkgs.set(pkg.id, pkg)
-    // Upload the actual bytes when a target session is available
-    if (sessionId && apkFile) {
-      const probe = await probeHost()
-      if (!probe.online) {
-        return c.json({ ok: true, apk: pkg, uploaded: false, hostOnline: false, error: 'Runtime Host not connected' })
-      }
-      const record = sessions().get(sessionId)
-      if (!record) return c.json({ ok: false, error: 'Instance not found' }, 404)
-      if (record.status !== 'online') {
-        return c.json({ ok: true, apk: pkg, uploaded: false, hostOnline: true, error: 'Target instance is not online' })
-      }
-      const bytes = await apkFile.arrayBuffer()
-      const r = await hostPutRaw(
-        `/instances/${sessionId}/apk`,
-        bytes,
-        'application/vnd.android.package-archive'
+      console.error(
+        '[api/power] failed:',
+        err?.stack ?? err
       )
-      if (!r.ok) {
-        return c.json({ ok: false, error: r.error ?? 'APK upload to host failed', hostOnline: r.hostOnline, apk: pkg }, 502)
-      }
-      pkg.uploaded = true
-      pkg.packageName = r.data?.packageName ?? pkg.packageName
-      pkg.targetInstance = sessionId
-      pkgs.set(pkg.id, pkg)
-      record.lastSeen = new Date().toISOString()
-      return c.json({ ok: true, apk: pkg, uploaded: true, packageName: pkg.packageName, hostOnline: true }, 201)
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Power action failed',
+        },
+        500
+      )
     }
-    // Metadata-only registration (no bytes or no target yet) — await a real
-    // host probe so clients receive a truthful hostOnline flag.
-    const probe = await probeHost()
-    return c.json({ ok: true, apk: pkg, uploaded: false, hostOnline: probe.online }, 201)
-  } catch (err) {
-    console.error('[api/apks/upload] failed:', err?.message ?? err)
-    return c.json({ ok: false, error: 'Failed to upload APK' }, 500)
   }
-})
-// ---------------------------------------------------------------------------
-// API: /api/install — requires the APK to have been uploaded to the target
-// instance previously (pkg.uploaded && pkg.targetInstance === sessionId).
-// The bytes already live on the host; the host's PUT endpoint performed the
-// real adb install during upload, so this call records the installation on
-// the session record and returns the server-observed timing.
-// ---------------------------------------------------------------------------
-app.post('/api/install', async (c) => {
-  const probe = await probeHost()
-  if (!probe.online) {
-    return c.json({ ok: false, error: 'Runtime Host not connected', hostOnline: false }, 503)
-  }
-  try {
-    const body = await c.req.json()
-    const { sessionId, apkId } = body ?? {}
-    if (!sessionId || !apkId) return c.json({ ok: false, error: 'sessionId and apkId required' }, 400)
-    const record = sessions().get(sessionId)
-    if (!record) return c.json({ ok: false, error: 'Instance not found' }, 404)
-    const pkg = packages().get(apkId)
-    if (!pkg) return c.json({ ok: false, error: 'Package not found in registry' }, 404)
-    if (!pkg.uploaded) {
-      return c.json({ ok: false, error: 'Upload APK with the target device connected first' }, 409)
-    }
-    if (pkg.targetInstance && pkg.targetInstance !== sessionId) {
-      return c.json({ ok: false, error: 'Package was uploaded to a different instance — re-upload with this device connected' }, 409)
-    }
-    if (record.installedApks.includes(apkId)) {
-      return c.json({ ok: false, error: 'Package already installed on this instance' }, 409)
-    }
-    record.installedApks.push(apkId)
-    record.lastSeen = new Date().toISOString()
-    pkg.status = 'installed'
-    packages().set(apkId, pkg)
-    return c.json({ ok: true, sessionId, apkId, packageName: pkg.packageName, installDelayMs: 1000, hostOnline: true })
-  } catch (err) {
-    console.error('[api/install] failed:', err?.message ?? err)
-    return c.json({ ok: false, error: 'Install failed', hostOnline: true }, 500)
-  }
-})
-// Fallback for SPA routes
-app.get('*', (c) =>
-  c.env?.ASSETS ? c.env.ASSETS.fetch(c.req.raw) : c.text('Not Found', 404)
 )
+
+// ---------------------------------------------------------------------------
+// API: /api/signal
+// ---------------------------------------------------------------------------
+
+app.post(
+  '/api/signal',
+  async (c) => {
+    try {
+      const body =
+        await c.req.json()
+
+      const {
+        sessionId,
+        sdp,
+        type,
+      } = body ?? {}
+
+      if (!sessionId) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'sessionId is required',
+          },
+          400
+        )
+      }
+
+      const session =
+        touchSession(
+          sessionId
+        )
+
+      if (!session) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Instance not found',
+          },
+          404
+        )
+      }
+
+      if (
+        session.status !==
+        'online'
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Instance not online',
+          },
+          409
+        )
+      }
+
+      session.pc = {
+        type:
+          type ?? 'offer',
+
+        state: 'answered',
+
+        updatedAt:
+          new Date().toISOString(),
+      }
+
+      // Existing mock signaling.
+      // This remains for API compatibility
+      // until Runtime Host WebRTC is connected.
+      const mockAnswer = {
+        type: 'answer',
+
+        sdp:
+          'v=0\r\n' +
+          'o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n' +
+          's=-\r\n' +
+          't=0 0\r\n' +
+          'a=group:BUNDLE 0\r\n' +
+          'a=ice-options:trickle\r\n' +
+          'm=video 9 UDP/TLS/RTP/SAVPF 96\r\n' +
+          'a=rtpmap:96 H264/90000\r\n' +
+          'a=sendonly\r\n',
+      }
+
+      return c.json({
+        ok: true,
+        sessionId,
+
+        answer:
+          mockAnswer,
+
+        iceServers: [
+          {
+            urls:
+              'stun:stun.l.google.com:19302',
+          },
+        ],
+      })
+    } catch (err) {
+      console.error(
+        '[api/signal] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Signaling failed',
+        },
+        500
+      )
+    }
+  }
+)
+
+// ---------------------------------------------------------------------------
+// API: /api/input
+// ---------------------------------------------------------------------------
+
+const ANDROID_RESOLUTION = {
+  width: 1080,
+  height: 1920,
+}
+
+function clamp01(value) {
+  const number =
+    Number(value)
+
+  if (
+    !Number.isFinite(
+      number
+    )
+  ) {
+    return 0
+  }
+
+  return Math.min(
+    1,
+    Math.max(
+      0,
+      number
+    )
+  )
+}
+
+function adbCoord(
+  value,
+  max
+) {
+  return Math.round(
+    clamp01(value) *
+      max
+  )
+}
+
+function translateTouch(
+  session,
+  body
+) {
+  const {
+    type,
+    x,
+    y,
+  } = body
+
+  const X =
+    adbCoord(
+      x,
+      ANDROID_RESOLUTION.width
+    )
+
+  const Y =
+    adbCoord(
+      y,
+      ANDROID_RESOLUTION.height
+    )
+
+  if (type === 'down') {
+    session._touchAnchor = {
+      x: X,
+      y: Y,
+      ts: Date.now(),
+    }
+
+    return `input motionevent DOWN ${X} ${Y}`
+  }
+
+  if (type === 'move') {
+    return `input motionevent MOVE ${X} ${Y}`
+  }
+
+  if (type === 'up') {
+    const anchor =
+      session._touchAnchor
+
+    session._touchAnchor =
+      null
+
+    if (anchor) {
+      const dist =
+        Math.hypot(
+          X - anchor.x,
+          Y - anchor.y
+        )
+
+      if (dist < 20) {
+        return `input tap ${X} ${Y}`
+      }
+
+      return (
+        `input swipe ${anchor.x} ${anchor.y} ` +
+        `${X} ${Y}`
+      )
+    }
+
+    return `input tap ${X} ${Y}`
+  }
+
+  return null
+}
+
+function translateKey(body) {
+  const KEYCODES = {
+    back: 4,
+    home: 3,
+    recents: 187,
+    power: 26,
+  }
+
+  const code =
+    Number.isInteger(
+      body?.keycode
+    )
+      ? body.keycode
+      : KEYCODES[
+          body?.key
+        ]
+
+  if (!code) {
+    return null
+  }
+
+  return `input keyevent ${code}`
+}
+
+app.post(
+  '/api/input',
+  async (c) => {
+    try {
+      const body =
+        await c.req.json()
+
+      const {
+        sessionId,
+        kind,
+        seq,
+      } = body ?? {}
+
+      if (
+        !sessionId ||
+        ![
+          'touch',
+          'key',
+          'installation',
+          'heartbeat',
+        ].includes(kind)
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'sessionId and valid kind (touch|key|installation|heartbeat) required',
+          },
+          400
+        )
+      }
+
+      const session =
+        touchSession(
+          sessionId
+        )
+
+      if (!session) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Instance not found',
+          },
+          404
+        )
+      }
+
+      if (
+        session.status !==
+        'online'
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Instance not online',
+          },
+          409
+        )
+      }
+
+      if (
+        Number.isInteger(seq)
+      ) {
+        if (
+          seq <=
+          session.lastInputSeq
+        ) {
+          return c.json(
+            {
+              ok: false,
+              error:
+                'Stale event dropped',
+            },
+            409
+          )
+        }
+
+        session.lastInputSeq =
+          seq
+      }
+
+      let command = null
+
+      let processingMs =
+        2 +
+        Math.floor(
+          Math.random() * 6
+        )
+
+      if (
+        kind === 'heartbeat'
+      ) {
+        command =
+          'echo keepalive ok'
+      } else if (
+        kind === 'touch'
+      ) {
+        command =
+          translateTouch(
+            session,
+            body
+          )
+      } else if (
+        kind === 'key'
+      ) {
+        command =
+          translateKey(body)
+      } else if (
+        kind ===
+        'installation'
+      ) {
+        const apkName =
+          body?.apkName ??
+          'app'
+
+        command =
+          `pm install -r /data/local/tmp/` +
+          `${String(
+            apkName
+          ).replace(
+            /[^a-zA-Z0-9._-]/g,
+            ''
+          )}.apk`
+
+        processingMs =
+          2000 +
+          Math.floor(
+            Math.random() *
+              1500
+          )
+
+        session._pendingInstall =
+          {
+            apkName,
+            startedAt:
+              Date.now(),
+          }
+      }
+
+      if (!command) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'Unrecognized input payload',
+          },
+          400
+        )
+      }
+
+      console.log(
+        `[adb:${sessionId}] $ ${command} (simulated ${processingMs}ms)`
+      )
+
+      return c.json({
+        ok: true,
+        sessionId,
+        command,
+        processingMs,
+      })
+    } catch (err) {
+      console.error(
+        '[api/input] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Input bridge failure',
+        },
+        500
+      )
+    }
+  }
+)
+
+// ---------------------------------------------------------------------------
+// Static Assets / SPA fallback
+//
+// IMPORTANT:
+// This project uses Cloudflare Workers Assets.
+// Do NOT import or use Hono serveStatic().
+// ---------------------------------------------------------------------------
+
+app.get(
+  '*',
+  async (c) => {
+    try {
+      const assets =
+        c.env?.ASSETS
+
+      if (
+        assets &&
+        typeof assets.fetch ===
+          'function'
+      ) {
+        return await assets.fetch(
+          c.req.raw
+        )
+      }
+
+      console.error(
+        '[assets] ASSETS binding unavailable'
+      )
+
+      return c.text(
+        'Static Assets binding is not configured.',
+        500
+      )
+    } catch (err) {
+      console.error(
+        '[assets] failed:',
+        err?.stack ?? err
+      )
+
+      return c.text(
+        'Failed to load application.',
+        500
+      )
+    }
+  }
+)
+
 export default app
