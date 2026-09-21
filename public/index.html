@@ -75,6 +75,18 @@
           </div>
         </div>
       </header>
+      <!-- Runtime Host banner (hidden until host is offline) -->
+      <div id="host-banner" class="hidden host-banner">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div class="py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div class="flex items-start sm:items-center gap-3">
+              <svg class="w-5 h-5 text-amber-400 shrink-0 mt-0.5 sm:mt-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              <p class="text-sm text-amber-300">Runtime Host offline — provisioning and streaming disabled</p>
+            </div>
+            <button id="host-retry" class="shrink-0 px-4 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400">Retry connection</button>
+          </div>
+        </div>
+      </div>
       <!-- Root container per UI non-negotiables -->
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div class="py-8 md:py-10 lg:py-12">
@@ -90,7 +102,7 @@
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v6h-6"/></svg>
                   Refresh
                 </button>
-                <button id="provision-btn" class="glow-button inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950">
+                <button id="provision-btn" class="glow-button inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950" title="Requires a connected Runtime Host">
                   <svg id="provision-icon" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                   <span id="provision-spinner" class="hidden w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></span>
                   Provision New Phone
@@ -137,7 +149,7 @@
               <!-- Phone canvas -->
               <div class="flex-1 w-full flex flex-col items-center">
                 <div class="phone-frame relative w-full max-w-[360px] aspect-[9/16] rounded-[2rem] border border-slate-700 bg-black shadow-[0_0_60px_rgba(59,130,246,0.15)] overflow-hidden">
-                  <canvas id="phone-canvas" class="absolute inset-0 w-full h-full touch-none cursor-crosshair" width="360" height="640" aria-label="Android device screen"></canvas>
+                  <video id="phone-video" class="absolute inset-0 w-full h-full object-contain bg-black hidden" autoplay playsinline muted aria-label="Android device live video"></video>
                   <div id="stream-status" class="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-slate-950/95 text-center px-6 transition-opacity duration-300">
                     <div class="loading-spinner"></div>
                     <p id="stream-status-text" class="text-sm text-slate-400">Initializing stream…</p>
@@ -204,7 +216,7 @@
                     <div class="h-1.5 rounded-full bg-slate-800 overflow-hidden">
                       <div id="apk-bar" class="h-full rounded-full bg-blue-500 transition-all duration-300" style="width:0%"></div>
                     </div>
-                    <p id="apk-status-text" class="text-xs text-slate-500 mt-2">Uploading…</p>
+                    <p id="apk-status-text" class="text-xs text-slate-500 mt-2">Uploading to Runtime Host…</p>
                   </div>
                   <button id="go-repository-btn" class="mt-4 w-full px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">Open APK Repository →</button>
                 </div>
