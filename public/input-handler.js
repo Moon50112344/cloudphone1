@@ -1,11 +1,15 @@
 /**
  * AetherDroid — Input Handler
- * Translates browser mouse/touch events on the Android canvas into
+ * Translates browser mouse/touch events on the Android video element into
  * standardized percentage-based coordinate payloads (0.0 → 1.0),
  * with move-event throttling (~30ms), monotonic sequencing, and
  * local visual touch feedback for low-perceived-latency interaction.
+ *
+ * Binds to #phone-video (the live WebRTC video inside the phone frame).
+ * Because the video starts hidden inside the Live View, listeners attach
+ * lazily: init retries on view switches and via a MutationObserver.
  */
-const CANVAS_ID = 'phone-canvas';
+const CANVAS_ID = 'phone-video';
 const DEBUG_ID = 'coord-debug';
 const MOVE_THROTTLE_MS = 30;
 const listeners = {
@@ -13,6 +17,8 @@ const listeners = {
   onKey: null,
 };
 let seq = 0;
+let initialized = false;
+let observer = null;
 /**
  * Register a callback that receives normalized input payloads.
  * payload: { type: 'down'|'move'|'up', x: 0..1, y: 0..1, seq, ts }
@@ -23,7 +29,7 @@ export function onInput(callback) {
 export function onHardwareKey(callback) {
   listeners.onKey = typeof callback === 'function' ? callback : listeners.onKey;
 }
-/** Normalize a client point into canvas-relative percentage coords (bounds-checked). */
+/** Normalize a client point into video-relative percentage coords (bounds-checked). */
 export function normalizePoint(canvas, clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   if (!rect.width || !rect.height) return { x: 0, y: 0 };
@@ -35,7 +41,7 @@ export function normalizePoint(canvas, clientX, clientY) {
   return { x, y };
 }
 // ---------------------------------------------------------------------------
-// Local touch feedback ring (pure visual, appended to the phone frame)
+// Local touch feedback ring (pure visual, attached to the phone frame)
 // ---------------------------------------------------------------------------
 let feedbackEl = null;
 let feedbackTimer = null;
@@ -101,14 +107,26 @@ export function emitKeyboard(e) {
 export function initInputHandler() {
   const canvas = document.getElementById(CANVAS_ID);
   if (!canvas) {
-    console.warn('[input-handler] canvas not found, input capture disabled');
+    // The Live View may not be mounted/visible yet — watch the DOM and retry
+    if (!observer && typeof MutationObserver !== 'undefined') {
+      observer = new MutationObserver(() => {
+        if (document.getElementById(CANVAS_ID)) {
+          observer.disconnect();
+          observer = null;
+          initInputHandler();
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
     return;
   }
+  if (initialized) return;
+  initialized = true;
   let pointerActive = false;
   // --- Pointer events (covers mouse + touch + pen) ---
   canvas.addEventListener('pointerdown', (e) => {
     pointerActive = true;
-    canvas.setPointerCapture(e.pointerId);
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
     emit('down', canvas, e.clientX, e.clientY, true);
   });
   canvas.addEventListener('pointermove', (e) => {
