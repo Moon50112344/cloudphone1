@@ -1,12 +1,17 @@
 /**
  * AetherDroid — Control Plane (Hono backend)
- * Phase 5: Persistence & Watchdog
+ * Phase 6: Real Runtime Host Bridge
  *
  * IMPORTANT:
  * - Cloudflare Workers Assets is used for static files.
  * - Do NOT use Hono serveStatic().
- * - Android/ADB/WebRTC parts remain compatible with the
- *   existing AetherDroid API structure.
+ * - Android lifecycle/input/signaling are forwarded
+ *   to the real Runtime Host.
+ *
+ * Runtime Host:
+ *   RUNTIME_HOST_ID=https://your-public-runtime-host
+ *
+ * It is also accepted when the value ends with /health.
  */
 
 import { Hono } from 'hono'
@@ -20,24 +25,140 @@ const app = new Hono()
 app.use('/api/*', async (c, next) => {
   await next()
 
-  c.header('Access-Control-Allow-Origin', '*')
+  c.header(
+    'Access-Control-Allow-Origin',
+    '*'
+  )
+
   c.header(
     'Access-Control-Allow-Methods',
-    'GET, POST, OPTIONS'
+    'GET, POST, PUT, OPTIONS'
   )
+
   c.header(
     'Access-Control-Allow-Headers',
-    'Content-Type'
+    'Content-Type, Authorization'
   )
 })
 
-app.options('/api/*', (c) => c.text('', 204))
+app.options('/api/*', (c) =>
+  c.text('', 204)
+)
+
+// ---------------------------------------------------------------------------
+// Runtime Host bridge
+// ---------------------------------------------------------------------------
+
+function getRuntimeHost(c) {
+  const value = String(
+    c.env?.RUNTIME_HOST_ID ?? ''
+  ).trim()
+
+  if (!value) {
+    throw new Error(
+      'RUNTIME_HOST_ID is not configured'
+    )
+  }
+
+  return value
+    .replace(/\/health\/?$/i, '')
+    .replace(/\/+$/, '')
+}
+
+async function runtimeFetch(
+  c,
+  pathname,
+  options = {}
+) {
+  const base =
+    getRuntimeHost(c)
+
+  const path =
+    pathname.startsWith('/')
+      ? pathname
+      : `/${pathname}`
+
+  const headers = new Headers(
+    options.headers ?? {}
+  )
+
+  if (
+    options.body &&
+    !headers.has(
+      'Content-Type'
+    ) &&
+    !(options.body instanceof ArrayBuffer) &&
+    !(options.body instanceof Uint8Array) &&
+    !(options.body instanceof Blob)
+  ) {
+    headers.set(
+      'Content-Type',
+      'application/json'
+    )
+  }
+
+  return fetch(
+    `${base}${path}`,
+    {
+      ...options,
+      headers,
+    }
+  )
+}
+
+async function runtimeJson(
+  response
+) {
+  const text =
+    await response.text()
+
+  if (!text) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(text)
+  } catch {
+    return {
+      ok: response.ok,
+      raw: text,
+    }
+  }
+}
+
+function runtimeError(
+  data,
+  fallback
+) {
+  if (
+    data &&
+    typeof data.error ===
+      'string'
+  ) {
+    return data.error
+  }
+
+  if (
+    data &&
+    typeof data.message ===
+      'string'
+  ) {
+    return data.message
+  }
+
+  return fallback
+}
 
 // ---------------------------------------------------------------------------
 // Simulated persistence layer
+//
+// IMPORTANT:
+// Cloudflare Workers isolates are ephemeral.
+// This keeps the original API structure, but is not durable storage.
 // ---------------------------------------------------------------------------
 
-const PERSIST_KEY = 'aetherdroid.state'
+const PERSIST_KEY =
+  'aetherdroid.state'
 
 function createState() {
   return {
@@ -49,7 +170,8 @@ function createState() {
 
 function loadPersisted() {
   try {
-    const existing = globalThis[PERSIST_KEY]
+    const existing =
+      globalThis[PERSIST_KEY]
 
     if (
       existing &&
@@ -59,9 +181,11 @@ function loadPersisted() {
       return existing
     }
 
-    const state = createState()
+    const state =
+      createState()
 
-    globalThis[PERSIST_KEY] = state
+    globalThis[PERSIST_KEY] =
+      state
 
     return state
   } catch (err) {
@@ -70,10 +194,12 @@ function loadPersisted() {
       err?.stack ?? err
     )
 
-    const state = createState()
+    const state =
+      createState()
 
     try {
-      globalThis[PERSIST_KEY] = state
+      globalThis[PERSIST_KEY] =
+        state
     } catch {}
 
     return state
@@ -96,7 +222,11 @@ function packages() {
 // Session configuration
 // ---------------------------------------------------------------------------
 
-const OS_VERSIONS = ['13', '12', '11']
+const OS_VERSIONS = [
+  '13',
+  '12',
+  '11',
+]
 
 const REGIONS = [
   'us-east',
@@ -104,7 +234,9 @@ const REGIONS = [
   'ap-south',
 ]
 
-function makeSession(overrides = {}) {
+function makeSession(
+  overrides = {}
+) {
   const id =
     overrides.id ??
     `ad-${Math.random()
@@ -183,10 +315,15 @@ function getSession(id) {
     return null
   }
 
-  return sessions().get(id) ?? null
+  return (
+    sessions().get(id) ??
+    null
+  )
 }
 
-function serializeSession(session) {
+function serializeSession(
+  session
+) {
   if (!session) {
     return null
   }
@@ -215,13 +352,13 @@ function serializeSession(session) {
         )
       : 0
 
-  const h = Math.floor(
-    uptime / 3600
-  )
+  const h =
+    Math.floor(
+      uptime / 3600
+    )
 
-  const d = Math.floor(
-    h / 24
-  )
+  const d =
+    Math.floor(h / 24)
 
   return {
     ...session,
@@ -234,7 +371,8 @@ function serializeSession(session) {
     _pendingInstall:
       undefined,
 
-    uptimeSeconds: uptime,
+    uptimeSeconds:
+      uptime,
 
     vRuntime:
       `${d}d ${h % 24}h`,
@@ -246,7 +384,8 @@ function serializeSession(session) {
 // ---------------------------------------------------------------------------
 
 function seedPackages() {
-  const store = packages()
+  const store =
+    packages()
 
   if (store.size > 0) {
     return
@@ -273,17 +412,21 @@ function seedPackages() {
   ]
 
   for (const item of seed) {
-    store.set(item.id, {
-      ...item,
-      status: 'pending',
-      addedAt:
-        new Date().toISOString(),
-    })
+    store.set(
+      item.id,
+      {
+        ...item,
+        status: 'pending',
+        addedAt:
+          new Date().toISOString(),
+      }
+    )
   }
 }
 
 function touchSession(id) {
-  const session = getSession(id)
+  const session =
+    getSession(id)
 
   if (session) {
     session.lastSeen =
@@ -407,7 +550,8 @@ function nodeHealth(
 }
 
 function sweepStaleSessions() {
-  const now = Date.now()
+  const now =
+    Date.now()
 
   let removed = 0
 
@@ -431,7 +575,6 @@ function sweepStaleSessions() {
           1000
     ) {
       sessions().delete(id)
-
       removed++
     }
   }
@@ -442,6 +585,63 @@ function sweepStaleSessions() {
     )
   }
 }
+
+// ---------------------------------------------------------------------------
+// API: /api/runtime-health
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/runtime-health',
+  async (c) => {
+    try {
+      const response =
+        await runtimeFetch(
+          c,
+          '/health',
+          {
+            method: 'GET',
+          }
+        )
+
+      const data =
+        await runtimeJson(
+          response
+        )
+
+      return c.json(
+        {
+          ok:
+            response.ok &&
+            data?.ok !== false,
+
+          runtime:
+            data,
+
+          status:
+            response.status,
+        },
+        response.ok
+          ? 200
+          : 502
+      )
+    } catch (err) {
+      console.error(
+        '[api/runtime-health] failed:',
+        err?.stack ?? err
+      )
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            err?.message ??
+            'Runtime Host unavailable',
+        },
+        502
+      )
+    }
+  }
+)
 
 // ---------------------------------------------------------------------------
 // API: /api/watchdog
@@ -640,6 +840,17 @@ app.post(
 
 // ---------------------------------------------------------------------------
 // API: /api/install
+//
+// The old implementation only simulated installation.
+// Real APK installation is handled by Runtime Host.
+//
+// Supported:
+// - body.apkData: base64 APK
+// - body.apkUrl: public URL to APK
+// - body.apkName: filename
+//
+// If only apkId is supplied, the package is registered but there is no
+// APK binary available to install.
 // ---------------------------------------------------------------------------
 
 app.post(
@@ -731,45 +942,243 @@ app.post(
         )
       }
 
-      const safeName =
-        pkg.name
-          .toLowerCase()
-          .replace(
-            /[^a-z0-9]/g,
+      /*
+       * If an APK URL is supplied, download it from the Worker and
+       * forward the binary to Runtime Host.
+       */
+      if (
+        body?.apkUrl
+      ) {
+        const apkResponse =
+          await fetch(
+            String(
+              body.apkUrl
+            )
+          )
+
+        if (!apkResponse.ok) {
+          return c.json(
+            {
+              ok: false,
+              error:
+                `Failed to download APK: HTTP ${apkResponse.status}`,
+            },
+            502
+          )
+        }
+
+        const apkBytes =
+          await apkResponse.arrayBuffer()
+
+        const safeName =
+          String(
+            body?.apkName ??
+              pkg.name
+          )
+            .replace(
+              /[^a-zA-Z0-9._-]/g,
+              ''
+            )
+
+        const fileName =
+          safeName.endsWith(
+            '.apk'
+          )
+            ? safeName
+            : `${safeName}.apk`
+
+        const runtimeResponse =
+          await runtimeFetch(
+            c,
+            `/instances/${encodeURIComponent(
+              sessionId
+            )}/apk`,
+            {
+              method: 'PUT',
+              headers: {
+                'Content-Type':
+                  'application/vnd.android.package-archive',
+
+                'X-Filename':
+                  fileName,
+              },
+              body:
+                apkBytes,
+            }
+          )
+
+        const runtimeData =
+          await runtimeJson(
+            runtimeResponse
+          )
+
+        if (
+          !runtimeResponse.ok
+        ) {
+          return c.json(
+            {
+              ok: false,
+              error:
+                runtimeError(
+                  runtimeData,
+                  'Runtime Host APK installation failed'
+                ),
+              runtime:
+                runtimeData,
+            },
+            502
+          )
+        }
+
+        session.installedApks.push(
+          apkId
+        )
+
+        pkg.status =
+          'installed'
+
+        session.lastSeen =
+          new Date().toISOString()
+
+        return c.json({
+          ok: true,
+          sessionId,
+          apkId,
+          runtime:
+            runtimeData,
+        })
+      }
+
+      /*
+       * Base64 APK support.
+       */
+      if (
+        typeof body?.apkData ===
+        'string'
+      ) {
+        const base64 =
+          body.apkData
+            .replace(
+              /^data:.*?;base64,/,
+              ''
+            )
+            .replace(
+              /\s/g,
+              ''
+            )
+
+        let binary
+
+        try {
+          const raw =
+            atob(base64)
+
+          binary =
+            new Uint8Array(
+              raw.length
+            )
+
+          for (
+            let i = 0;
+            i < raw.length;
+            i++
+          ) {
+            binary[i] =
+              raw.charCodeAt(i)
+          }
+        } catch {
+          return c.json(
+            {
+              ok: false,
+              error:
+                'Invalid base64 APK data',
+            },
+            400
+          )
+        }
+
+        const fileName =
+          String(
+            body?.apkName ??
+              `${pkg.name}.apk`
+          ).replace(
+            /[^a-zA-Z0-9._-]/g,
             ''
           )
 
-      const fileName =
-        `${safeName}-v${pkg.version}.apk`
+        const runtimeResponse =
+          await runtimeFetch(
+            c,
+            `/instances/${encodeURIComponent(
+              sessionId
+            )}/apk`,
+            {
+              method: 'PUT',
+              headers: {
+                'Content-Type':
+                  'application/vnd.android.package-archive',
 
-      const command =
-        `pm install -r /data/local/tmp/${fileName}`
+                'X-Filename':
+                  fileName,
+              },
+              body:
+                binary,
+            }
+          )
 
-      const installDelayMs =
-        2500 +
-        Math.floor(
-          Math.random() *
-            1500
+        const runtimeData =
+          await runtimeJson(
+            runtimeResponse
+          )
+
+        if (
+          !runtimeResponse.ok
+        ) {
+          return c.json(
+            {
+              ok: false,
+              error:
+                runtimeError(
+                  runtimeData,
+                  'Runtime Host APK installation failed'
+                ),
+              runtime:
+                runtimeData,
+            },
+            502
+          )
+        }
+
+        session.installedApks.push(
+          apkId
         )
 
-      session.installedApks.push(
-        apkId
+        pkg.status =
+          'installed'
+
+        session.lastSeen =
+          new Date().toISOString()
+
+        return c.json({
+          ok: true,
+          sessionId,
+          apkId,
+          runtime:
+            runtimeData,
+        })
+      }
+
+      /*
+       * Do not pretend that an APK was installed when only metadata exists.
+       */
+      return c.json(
+        {
+          ok: false,
+          error:
+            'APK binary is required. Provide apkUrl or apkData.',
+        },
+        400
       )
-
-      pkg.status =
-        'installed'
-
-      console.log(
-        `[adb:${sessionId}] $ adb shell ${command} (simulated ${installDelayMs}ms)`
-      )
-
-      return c.json({
-        ok: true,
-        sessionId,
-        apkId,
-        command,
-        installDelayMs,
-      })
     } catch (err) {
       console.error(
         '[api/install] failed:',
@@ -794,7 +1203,7 @@ app.post(
 
 app.get(
   '/api/instances',
-  (c) => {
+  async (c) => {
     try {
       const store =
         sessions()
@@ -901,7 +1310,10 @@ app.get(
 
           vcpu:
             list.reduce(
-              (total, session) =>
+              (
+                total,
+                session
+              ) =>
                 total +
                 (session.status ===
                 'online'
@@ -914,7 +1326,10 @@ app.get(
 
           ram:
             list.reduce(
-              (total, session) =>
+              (
+                total,
+                session
+              ) =>
                 total +
                 (session.status ===
                 'online'
@@ -946,6 +1361,9 @@ app.get(
 
 // ---------------------------------------------------------------------------
 // API: /api/start
+//
+// REAL:
+// Cloudflare Worker -> Runtime Host -> Android Emulator
 // ---------------------------------------------------------------------------
 
 app.post(
@@ -979,6 +1397,53 @@ app.post(
               : 4,
         })
 
+      /*
+       * Save first so the Runtime Host and Worker use the same ID.
+       */
+      sessions().set(
+        session.id,
+        session
+      )
+
+      const runtimeResponse =
+        await runtimeFetch(
+          c,
+          `/instances/${encodeURIComponent(
+            session.id
+          )}/start`,
+          {
+            method: 'POST',
+          }
+        )
+
+      const runtimeData =
+        await runtimeJson(
+          runtimeResponse
+        )
+
+      if (
+        !runtimeResponse.ok ||
+        runtimeData?.ok === false
+      ) {
+        sessions().delete(
+          session.id
+        )
+
+        return c.json(
+          {
+            ok: false,
+            error:
+              runtimeError(
+                runtimeData,
+                'Runtime Host failed to start instance'
+              ),
+            runtime:
+              runtimeData,
+          },
+          502
+        )
+      }
+
       session.status =
         'online'
 
@@ -996,10 +1461,14 @@ app.post(
       return c.json(
         {
           ok: true,
+
           instance:
             serializeSession(
               session
             ),
+
+          runtime:
+            runtimeData,
         },
         201
       )
@@ -1013,9 +1482,10 @@ app.post(
         {
           ok: false,
           error:
+            err?.message ??
             'Failed to provision instance',
         },
-        500
+        502
       )
     }
   }
@@ -1023,6 +1493,9 @@ app.post(
 
 // ---------------------------------------------------------------------------
 // API: /api/power
+//
+// REAL:
+// start / stop / restart -> Runtime Host
 // ---------------------------------------------------------------------------
 
 app.post(
@@ -1084,6 +1557,41 @@ app.post(
         )
       }
 
+      const runtimeResponse =
+        await runtimeFetch(
+          c,
+          `/instances/${encodeURIComponent(
+            id
+          )}/${action}`,
+          {
+            method: 'POST',
+          }
+        )
+
+      const runtimeData =
+        await runtimeJson(
+          runtimeResponse
+        )
+
+      if (
+        !runtimeResponse.ok ||
+        runtimeData?.ok === false
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              runtimeError(
+                runtimeData,
+                'Runtime Host power action failed'
+              ),
+            runtime:
+              runtimeData,
+          },
+          502
+        )
+      }
+
       if (
         action === 'stop'
       ) {
@@ -1093,7 +1601,8 @@ app.post(
         session.bootedAt =
           null
 
-        session.pc = null
+        session.pc =
+          null
       } else {
         session.status =
           'online'
@@ -1101,18 +1610,28 @@ app.post(
         session.bootedAt =
           new Date().toISOString()
 
-        session.pc = null
+        session.pc =
+          null
       }
 
       session.lastSeen =
         new Date().toISOString()
 
+      sessions().set(
+        id,
+        session
+      )
+
       return c.json({
         ok: true,
+
         instance:
           serializeSession(
             session
           ),
+
+        runtime:
+          runtimeData,
       })
     } catch (err) {
       console.error(
@@ -1124,9 +1643,10 @@ app.post(
         {
           ok: false,
           error:
+            err?.message ??
             'Power action failed',
         },
-        500
+        502
       )
     }
   }
@@ -1134,6 +1654,11 @@ app.post(
 
 // ---------------------------------------------------------------------------
 // API: /api/signal
+//
+// REAL:
+// Browser -> Worker -> Runtime Host
+//
+// Runtime Host owns the actual WebRTC PeerConnection.
 // ---------------------------------------------------------------------------
 
 app.post(
@@ -1190,47 +1715,96 @@ app.post(
         )
       }
 
+      if (
+        typeof sdp !==
+        'string' ||
+        !sdp
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'sdp is required',
+          },
+          400
+        )
+      }
+
+      const runtimeResponse =
+        await runtimeFetch(
+          c,
+          '/signal',
+          {
+            method: 'POST',
+
+            body:
+              JSON.stringify({
+                sessionId,
+                sdp,
+                type:
+                  type ??
+                  'offer',
+              }),
+          }
+        )
+
+      const runtimeData =
+        await runtimeJson(
+          runtimeResponse
+        )
+
+      if (
+        !runtimeResponse.ok ||
+        runtimeData?.ok === false
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              runtimeError(
+                runtimeData,
+                'Runtime Host signaling failed'
+              ),
+            runtime:
+              runtimeData,
+          },
+          502
+        )
+      }
+
       session.pc = {
         type:
-          type ?? 'offer',
+          type ??
+          'offer',
 
-        state: 'answered',
+        state:
+          runtimeData?.answer
+            ? 'answered'
+            : 'signaling',
 
         updatedAt:
           new Date().toISOString(),
       }
 
-      // Existing mock signaling.
-      // This remains for API compatibility
-      // until Runtime Host WebRTC is connected.
-      const mockAnswer = {
-        type: 'answer',
-
-        sdp:
-          'v=0\r\n' +
-          'o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n' +
-          's=-\r\n' +
-          't=0 0\r\n' +
-          'a=group:BUNDLE 0\r\n' +
-          'a=ice-options:trickle\r\n' +
-          'm=video 9 UDP/TLS/RTP/SAVPF 96\r\n' +
-          'a=rtpmap:96 H264/90000\r\n' +
-          'a=sendonly\r\n',
-      }
+      session.lastSeen =
+        new Date().toISOString()
 
       return c.json({
         ok: true,
         sessionId,
 
         answer:
-          mockAnswer,
+          runtimeData?.answer ??
+          runtimeData,
 
-        iceServers: [
-          {
-            urls:
-              'stun:stun.l.google.com:19302',
-          },
-        ],
+        iceServers:
+          runtimeData?.iceServers ??
+          [
+            {
+              urls:
+                'stun:stun.l.google.com:19302',
+            },
+          ],
       })
     } catch (err) {
       console.error(
@@ -1242,9 +1816,10 @@ app.post(
         {
           ok: false,
           error:
+            err?.message ??
             'Signaling failed',
         },
-        500
+        502
       )
     }
   }
@@ -1252,6 +1827,9 @@ app.post(
 
 // ---------------------------------------------------------------------------
 // API: /api/input
+//
+// REAL:
+// Browser -> Worker -> Runtime Host -> ADB
 // ---------------------------------------------------------------------------
 
 const ANDROID_RESOLUTION = {
@@ -1463,13 +2041,11 @@ app.post(
           seq
       }
 
+      /*
+       * Keep the original translation logic so the frontend API
+       * remains compatible.
+       */
       let command = null
-
-      let processingMs =
-        2 +
-        Math.floor(
-          Math.random() * 6
-        )
 
       if (
         kind === 'heartbeat'
@@ -1506,13 +2082,6 @@ app.post(
             ''
           )}.apk`
 
-        processingMs =
-          2000 +
-          Math.floor(
-            Math.random() *
-              1500
-          )
-
         session._pendingInstall =
           {
             apkName,
@@ -1532,15 +2101,58 @@ app.post(
         )
       }
 
-      console.log(
-        `[adb:${sessionId}] $ ${command} (simulated ${processingMs}ms)`
-      )
+      /*
+       * Send the original event to Runtime Host.
+       * Runtime Host is responsible for the actual ADB operation.
+       */
+      const runtimeResponse =
+        await runtimeFetch(
+          c,
+          '/input',
+          {
+            method: 'POST',
+
+            body:
+              JSON.stringify({
+                ...body,
+                sessionId,
+              }),
+          }
+        )
+
+      const runtimeData =
+        await runtimeJson(
+          runtimeResponse
+        )
+
+      if (
+        !runtimeResponse.ok ||
+        runtimeData?.ok === false
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              runtimeError(
+                runtimeData,
+                'Runtime Host input failed'
+              ),
+            runtime:
+              runtimeData,
+          },
+          502
+        )
+      }
+
+      session.lastSeen =
+        new Date().toISOString()
 
       return c.json({
         ok: true,
         sessionId,
         command,
-        processingMs,
+        runtime:
+          runtimeData,
       })
     } catch (err) {
       console.error(
@@ -1552,9 +2164,10 @@ app.post(
         {
           ok: false,
           error:
+            err?.message ??
             'Input bridge failure',
         },
-        500
+        502
       )
     }
   }
